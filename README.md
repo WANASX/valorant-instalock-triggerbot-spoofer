@@ -67,6 +67,9 @@ pip install opencv-python numpy pyautogui pywin32 PyQt5 bettercam
 
 4. **Code Spoofing:**  
    Each run, the spoofer obfuscates the internal code (except for the UI design) and generates a uniquely named file in the `temp/` folder.
+   
+6. **Enemy Highlight Color**
+   Go to Valorant settings and change enemy highlight color to Yellow (protanopia)
 
 ## File Structure
 
