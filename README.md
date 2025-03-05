@@ -12,10 +12,10 @@ Valorant Trigger Bot & Spoofer is designed to assist players by:
 
 The tool features a user-friendly interface (built with PyQt5) that allows you to adjust settings such as field of view (FOV) and shooting delay.
 
-- **Official Website:** [GamerFun AI Menu: Undetectable Aimbot, Triggerbot & Safe Recoil Control for Top Shooter Games
+- **Official Website:** [GamerFun Valorant Trigger Bot, Instant Lock and Spoofer
 ](https://www.gamerfun.club/ai-aimbot-triggerbot-shooter-games)
 - **UnknownCheats Forum:** [[Release] GamerFun AI Menu: All mouse Aimbot, Triggerbot & Recoil Control Using LGUB Drivers](https://www.unknowncheats.me/forum/rainbow-six-siege/671029-gamerfun-ai-menu-mouse-aimbot-triggerbot-recoil-control-using-lgub-drivers.html)
-- **GitHub Repository:** [ai-aimbot-triggerbot](https://github.com/WANASX/valorant-instalock-triggerbot-spoofer)
+- **GitHub Repository:** [valorant-instalock-triggerbot-spoofer](https://github.com/WANASX/valorant-instalock-triggerbot-spoofer)
 
 ## Features
 
