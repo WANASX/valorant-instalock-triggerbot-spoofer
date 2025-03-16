@@ -16,7 +16,7 @@ The tool features a user-friendly interface (built with PyQt5) that allows you t
 ](https://www.gamerfun.club/gamerfun-valorant-trigger-bot-instant-lock-and-spoofer)
 - **UnknownCheats Forum:** [[Release] ⭐GamerFun Valo: Valorant Trigger Bot, Instant Lock and Spoofer](https://www.unknowncheats.me/forum/valorant/690063-gamerfun-valo-valorant-trigger-bot-instant-lock-spoofer.html)
 - **GitHub Repository:** [valorant-instalock-triggerbot-spoofer](https://github.com/WANASX/valorant-instalock-triggerbot-spoofer)
-
+![V2 Menu UI](menu.PNG)
 ## Features
 
 - **Auto Trigger:**  
