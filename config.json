@@ -1,7 +1,7 @@
 {
     "fov": 5.0,
     "keybind": 164,
-    "shooting_rate": 65.0,
+    "shooting_rate": 10.0,
     "fps": 200.0,
     "hsv_range": [
         [
@@ -15,5 +15,10 @@
             255
         ]
     ],
-    "shoot_key": 189
+    "shoot_key": 189,
+    "trigger_mode": "hold",
+    "press_duration_min": 0.08,
+    "press_duration_max": 0.03,
+    "block_movements": true,
+    "enable_press_duration": false
 }
