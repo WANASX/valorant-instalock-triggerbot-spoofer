@@ -1,8 +1,8 @@
 {
-    "fov": 5.0,
+    "fov": 2.0,
     "keybind": 164,
-    "shooting_rate": 10.0,
-    "fps": 200.0,
+    "shooting_rate": 45.0,
+    "fps": 230.0,
     "hsv_range": [
         [
             30,
@@ -17,8 +17,17 @@
     ],
     "shoot_key": 189,
     "trigger_mode": "hold",
-    "press_duration_min": 0.08,
-    "press_duration_max": 0.03,
-    "block_movements": true,
-    "enable_press_duration": false
+    "press_duration_min": 0.02,
+    "press_duration_max": 0.09,
+    "block_movements": false,
+    "enable_press_duration": true,
+    "use_gpu": true,
+    "active_tab": 3,
+    "theme": "custom",
+    "auto_fallback_to_cpu": true,
+    "test_mode": false,
+    "smart_acceleration": false,
+    "capture_method": "dxcam",
+    "min_shooting_rate": 35.0,
+    "max_shooting_rate": 55.0
 }
