@@ -1,6 +1,6 @@
 # CHANGELOG
 
-## Version 3.0.0 (2023-07-15)
+## Version 3.0.0 (2025-04-13)
 
 ### Major Features
 
