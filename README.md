@@ -33,6 +33,12 @@ The tool features a modern, user-friendly interface (built with PyQt5) that allo
 
 ![V4 Menu UI](Valo_Menu_V4.PNG)
 
+## Video Demonstration
+
+[![Valorant Trigger Bot, AimLock, Insta Lock & Spoofer | GPU & CPU Cheat Video Usage](https://img.youtube.com/vi/SIrBrGg_BQk/0.jpg)](https://www.youtube.com/watch?v=SIrBrGg_BQk)
+
+Watch the full usage and feature demo on YouTube: [Valorant Trigger Bot, AimLock, Insta Lock & Spoofer | GPU & CPU Cheat Video Usage](https://www.youtube.com/watch?v=SIrBrGg_BQk)
+
 ## Features
 
 - **Auto Trigger with Dynamic Delay:**  
@@ -78,7 +84,7 @@ The tool features a modern, user-friendly interface (built with PyQt5) that allo
    ```
 2. **Install all dependencies (except PyTorch):**
    ```sh
-   pip install -r requirements.txt --no-deps
+   pip install -r requirements.txt
    ```
    This will install all required packages except PyTorch. See below for GPU-enabled PyTorch installation.
 
