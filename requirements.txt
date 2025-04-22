@@ -1,0 +1,15 @@
+PyQt5
+opencv-python
+numpy
+torch
+pyautogui
+pywin32
+astor
+cryptography
+pyperclip
+mitmproxy
+easyocr
+mss
+pillow
+pynput
+valclient 

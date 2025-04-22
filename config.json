@@ -1,8 +1,7 @@
 {
-    "fov": 2.0,
+    "fov": 2,
     "keybind": 164,
-    "shooting_rate": 45.0,
-    "fps": 230.0,
+    "fps": 200.0,
     "hsv_range": [
         [
             30,
@@ -15,19 +14,33 @@
             255
         ]
     ],
-    "shoot_key": 189,
     "trigger_mode": "hold",
-    "press_duration_min": 0.02,
-    "press_duration_max": 0.09,
-    "block_movements": false,
-    "enable_press_duration": true,
+    "block_movements": true,
     "use_gpu": true,
-    "active_tab": 3,
-    "theme": "custom",
-    "auto_fallback_to_cpu": true,
+    "smart_acceleration": true,
     "test_mode": false,
-    "smart_acceleration": false,
-    "capture_method": "dxcam",
-    "min_shooting_rate": 35.0,
-    "max_shooting_rate": 55.0
+    "theme": "custom",
+    "aim_lock_enabled": true,
+    "aim_lock_mode": "hold",
+    "aim_lock_strength": 28,
+    "aim_lock_scan_area_x": 16,
+    "aim_lock_scan_area_y": 10,
+    "aim_lock_target_color": [
+        30,
+        255,
+        255
+    ],
+    "aim_lock_tolerance": 45,
+    "aim_lock_refresh_rate": 240,
+    "aim_lock_debug_mode": false,
+    "aim_lock_adaptive_scan": true,
+    "aim_lock_scan_pattern": "spiral",
+    "aim_lock_keybind": 160,
+    "min_shooting_delay_ms": 30.0,
+    "max_shooting_delay_ms": 40.0,
+    "enable_random_press_duration": true,
+    "press_duration_min_s": 0.01,
+    "press_duration_max_s": 0.05,
+    "shooting_rate": 35.0,
+    "aim_lock_toggle_key": "Shift"
 }

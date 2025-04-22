@@ -8,6 +8,7 @@ import re
 import ast
 import astor
 from collections import defaultdict
+from aimlock import AimLockController
 
 # Generate random strings for obfuscation
 def generate_random_string(length=10):
@@ -107,7 +108,9 @@ class NameRandomizer(ast.NodeTransformer):
         self.do_not_rename = set(do_not_rename or [
             'main', 'run', 'simulate_shoot', 'benchmark_gpu_vs_cpu', 'detect_color',
             'debug_log', 'load_config', 'save_config', '__init__', '__main__',
-            'toggle_triggerbot', 'update_config'
+            'toggle_triggerbot', 'update_config', 'get_latest_frame', 'update_check_region',
+            'update_hsv_range', 'detect_color_pytorch', 'fast_benchmark', 'check_opencv_cuda_support',
+            'stop', 'update_hsv_range'
         ])
         # Map original names to new names
         self.renames = {}
@@ -117,11 +120,13 @@ class NameRandomizer(ast.NodeTransformer):
         # Builtin function and module names to avoid renaming
         self.builtins = set(dir(__builtins__))
         self.modules = set(['os', 'sys', 'random', 'time', 'threading', 'cv2', 'numpy', 'torch',
-                           'PyQt5', 'ctypes', 'json', 'bettercam', 'multiprocessing'])
+                           'PyQt5', 'ctypes', 'json', 'bettercam', 'multiprocessing', 'win32api',
+                           'queue', 'traceback', 'threading', 'Process', 'Queue'])
         # Keep track of imported names
         self.imports = set()
         # Classes to keep intact
-        self.classes = set(['MainWindow', 'Triggerbot', 'TriggerBotThread', 'ScanningWorker'])
+        self.classes = set(['MainWindow', 'Triggerbot', 'TriggerBotThread', 'ScanningWorker',
+                           'QtCore', 'QThread'])
     
     def visit_Import(self, node):
         """Track imported names."""
@@ -354,9 +359,32 @@ def add_random_constants(code):
 def main():
     print("Enhanced spoofer starting...")
     
+    # Function to sanitize file content by removing null bytes and other non-printable characters
+    def sanitize_file_content(file_path):
+        try:
+            # Read content as binary
+            with open(file_path, "rb") as f:
+                content = f.read()
+            
+            # Filter out null bytes and convert to string
+            content_str = ""
+            for b in content:
+                if 32 <= b <= 126 or b in (9, 10, 13):  # ASCII printable chars or tab, newline, carriage return
+                    content_str += chr(b)
+            
+            return content_str
+        except Exception as e:
+            print(f"Error sanitizing file {file_path}: {str(e)}")
+            return None
+    
     input_filename = "menu.py"
     if not os.path.exists(input_filename):
         print(f"Error: {input_filename} not found!")
+        return
+
+    # Check for triggerbot.py
+    if not os.path.exists("triggerbot.py"):
+        print(f"Error: triggerbot.py not found!")
         return
 
     with open(input_filename, "r", encoding="utf-8") as f:
@@ -398,6 +426,121 @@ def main():
     os.makedirs(temp_folder, exist_ok=True)
 
     output_path = os.path.join(temp_folder, output_filename)
+    
+    # --- PATCH: Copy aimlock.py into temp directory for runner import ---
+    aimlock_src = "aimlock.py"
+    aimlock_dst = os.path.join(temp_folder, "aimlock.py")
+    try:
+        shutil.copy2(aimlock_src, aimlock_dst)
+    except Exception as e:
+        print(f"Error copying aimlock.py: {e}")
+        print("Critical error: Unable to copy aimlock.py for obfuscated runner.")
+        return
+    # --- END PATCH ---
+
+    # --- PATCH: Copy shared_scanner.py into temp directory for runner import ---
+    shared_scanner_src = "shared_scanner.py"
+    shared_scanner_dst = os.path.join(temp_folder, "shared_scanner.py")
+    try:
+        shutil.copy2(shared_scanner_src, shared_scanner_dst)
+    except Exception as e:
+        print(f"Error copying shared_scanner.py: {e}")
+        print("Critical error: Unable to copy shared_scanner.py for obfuscated runner.")
+        return
+    # --- END PATCH ---
+
+    # Process triggerbot.py with the same obfuscation techniques
+    triggerbot_filename = "triggerbot.py"
+    if os.path.exists(triggerbot_filename):
+        try:
+            # Instead of trying to read with utf-8 encoding which can fail,
+            # use the sanitize function directly
+            sanitized_content = sanitize_file_content(triggerbot_filename)
+            
+            if sanitized_content:
+                # Apply obfuscation to sanitized triggerbot.py
+                print("Applying obfuscation to triggerbot.py...")
+                try:
+                    # Apply obfuscation to the sanitized content
+                    obfuscated_content = obfuscate_segment(sanitized_content)
+                    
+                    # Add random constants
+                    obfuscated_content = add_random_constants(obfuscated_content)
+                    
+                    # Generate a different random verification for triggerbot
+                    triggerbot_verification = create_runtime_check()
+                    obfuscated_content = triggerbot_verification + obfuscated_content
+                    
+                    # Generate random name for triggerbot.py
+                    random_name_choice2 = random.choice(names)
+                    random_suffix2 = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
+                    triggerbot_output_filename = f"{random_name_choice2}_{random_suffix2}.py"
+                    
+                    # Final syntax check for triggerbot
+                    try:
+                        ast.parse(obfuscated_content)
+                        print("Obfuscated triggerbot.py passed syntax check")
+                    except SyntaxError as e:
+                        print(f"Warning: Obfuscated triggerbot.py has syntax errors: {str(e)}")
+                        print("Falling back to minimal obfuscation for triggerbot.py...")
+                        obfuscated_content = insert_random_comments(sanitized_content)
+                    
+                    # Update the menu file to import from the new random filename
+                    final_code = re.sub(r'(from|import)\s+triggerbot\b', f"\\1 {triggerbot_output_filename[:-3]}", final_code)
+                    final_code = re.sub(r'(from|import)\s+triggerbot\.', f"\\1 {triggerbot_output_filename[:-3]}.", final_code)
+                    
+                    # Write the obfuscated content
+                    triggerbot_output_path = os.path.join(temp_folder, triggerbot_output_filename)
+                    with open(triggerbot_output_path, "w", encoding="utf-8") as f:
+                        f.write(obfuscated_content)
+                    
+                    print(f"Successfully obfuscated triggerbot.py as {triggerbot_output_filename}")
+                except Exception as e:
+                    print(f"Error during obfuscation: {str(e)}")
+                    print("Falling back to sanitized-only copy")
+                    
+                    # Generate random name for triggerbot.py fallback
+                    random_name_choice2 = random.choice(names)
+                    random_suffix2 = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
+                    triggerbot_output_filename = f"{random_name_choice2}_{random_suffix2}.py"
+                    
+                    # Update the menu file to import from the new random filename
+                    final_code = re.sub(r'(from|import)\s+triggerbot\b', f"\\1 {triggerbot_output_filename[:-3]}", final_code)
+                    final_code = re.sub(r'(from|import)\s+triggerbot\.', f"\\1 {triggerbot_output_filename[:-3]}.", final_code)
+                    
+                    # Write the sanitized content
+                    triggerbot_output_path = os.path.join(temp_folder, triggerbot_output_filename)
+                    with open(triggerbot_output_path, "w", encoding="utf-8") as f:
+                        f.write(sanitized_content)
+                    
+                    print(f"Successfully copied and sanitized triggerbot.py as {triggerbot_output_filename}")
+            else:
+                print("Failed to sanitize triggerbot.py, using direct copy")
+                # Generate random name for direct copy
+                random_name_choice2 = random.choice(names)
+                random_suffix2 = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
+                triggerbot_output_filename = f"{random_name_choice2}_{random_suffix2}.py"
+                
+                # Update the menu file to import from the new random filename
+                final_code = re.sub(r'(from|import)\s+triggerbot\b', f"\\1 {triggerbot_output_filename[:-3]}", final_code)
+                final_code = re.sub(r'(from|import)\s+triggerbot\.', f"\\1 {triggerbot_output_filename[:-3]}.", final_code)
+                
+                # Direct copy as fallback
+                triggerbot_output_path = os.path.join(temp_folder, triggerbot_output_filename)
+                try:
+                    shutil.copy2("triggerbot.py", triggerbot_output_path)
+                    print(f"Successfully copied triggerbot.py as {triggerbot_output_filename}")
+                except Exception as copy_error:
+                    print(f"Error during copy: {str(copy_error)}")
+                    print("Critical error: Unable to process triggerbot.py")
+                    return
+        except Exception as e:
+            print(f"Error processing triggerbot.py: {str(e)}")
+            print("Critical error: Unable to process triggerbot.py")
+            return
+    else:
+        print(f"Error: {triggerbot_filename} not found!")
+        return
     
     # Final syntax check
     try:

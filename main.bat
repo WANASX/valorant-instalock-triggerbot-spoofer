@@ -10,5 +10,5 @@ if %errorLevel% neq 0 (
 :: Change directory to the folder where the BAT file is located.
 cd /d "%~dp0"
 
-python main.py
+python loader.py
 pause

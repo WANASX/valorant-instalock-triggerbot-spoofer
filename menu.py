@@ -4,12 +4,28 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import cv2, numpy as np, pyautogui
 import win32api, win32con
 from PyQt5 import QtWidgets, QtCore, QtGui
-from PyQt5.QtWidgets import QTabWidget, QSplitter, QStatusBar, QToolTip, QStyleFactory
+from PyQt5.QtWidgets import QTabWidget, QSplitter, QStatusBar, QToolTip, QStyleFactory, QFileDialog, QInputDialog
 import bettercam
 from tempfile import gettempdir
 from PIL import Image
 import traceback
 import queue
+import easyocr
+import mss
+
+# Import the triggerbot module
+from triggerbot import (
+    TriggerBotThread, 
+    simulate_shoot, 
+    detect_color, 
+    detect_color_pytorch, 
+    fast_benchmark, 
+    TORCH_AVAILABLE, 
+    shutdown_event
+)
+
+# Import AimLockController from aimlock.py
+from aimlock import AimLockController
 
 # Enable debug mode
 DEBUG_MODE = True
@@ -19,91 +35,17 @@ def debug_log(message):
     if DEBUG_MODE:
         print(f"[DEBUG] {time.strftime('%H:%M:%S')} - {message}")
 
-# Check if OpenCV was compiled with CUDA
-def check_opencv_cuda_support():
-    try:
-        # Try to create a CUDA-based function
-        test_array = np.zeros((10, 10), dtype=np.uint8)
-        test_gpu_mat = cv2.cuda_GpuMat()
-        test_gpu_mat.upload(test_array)
-        test_gpu_mat.release()
-        return True
-    except cv2.error as e:
-        if "no cuda support" in str(e).lower():
-            debug_log("OpenCV was not compiled with CUDA support")
-            return False
-        else:
-            debug_log(f"Other OpenCV error: {e}")
-            return False
-    except Exception as e:
-        debug_log(f"Error testing CUDA support: {e}")
-        return False
-
-# Improved CUDA detection
-CUDA_AVAILABLE = False
-OPENCV_HAS_CUDA = False
-try:
-    # First check if OpenCV was compiled with CUDA
-    OPENCV_HAS_CUDA = hasattr(cv2, 'cuda')
-    debug_log(f"OpenCV CUDA module exists: {OPENCV_HAS_CUDA}")
-    
-    if OPENCV_HAS_CUDA:
-        # Force enable CUDA for testing
-        debug_log("CUDA module exists - forcing CUDA_AVAILABLE to True for testing")
-        CUDA_AVAILABLE = True
-        
-        # Check if CUDA devices are available - just for logging
-        try:
-            cv2_cuda_count = cv2.cuda.getCudaEnabledDeviceCount()
-            debug_log(f"OpenCV CUDA devices detected: {cv2_cuda_count}")
-            if cv2_cuda_count == 0:
-                debug_log("WARNING: No CUDA devices detected, but continuing with CUDA enabled")
-        except Exception as e:
-            debug_log(f"Error checking CUDA devices: {e}")
-    else:
-        debug_log("WARNING: OpenCV was not compiled with CUDA support")
-        debug_log("To use CUDA acceleration, install OpenCV with CUDA support:")
-        debug_log("pip uninstall opencv-python opencv-python-headless")
-        debug_log("pip install opencv-python-cuda")
-        
-        # Try detecting CUDA from common installation paths
-        cuda_path = os.environ.get('CUDA_PATH')
-        if cuda_path and os.path.exists(cuda_path):
-            debug_log(f"CUDA found in environment at: {cuda_path}")
-            debug_log("CUDA is installed but OpenCV can't use it")
-        else:
-            possible_paths = [
-                r'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA',
-                r'C:\Program Files\NVIDIA\CUDA',
-                r'C:\CUDA'
-            ]
-            for path in possible_paths:
-                if os.path.exists(path):
-                    debug_log(f"CUDA installation found at: {path}")
-                    debug_log("CUDA is installed but OpenCV can't use it")
-                    break
-        
-except Exception as e:
-    debug_log(f"Error during CUDA detection: {e}")
-    traceback.print_exc()
-
-# Override CUDA availability - force it on for testing
-if hasattr(cv2, 'cuda'):
-    debug_log("OVERRIDING CUDA DETECTION: Forcing CUDA to be available for testing")
-    CUDA_AVAILABLE = True
-    OPENCV_HAS_CUDA = True
-
 # Import PyTorch for better GPU support
 try:
     import torch
     TORCH_AVAILABLE = torch.cuda.is_available()
     if TORCH_AVAILABLE:
-        debug_log(f"PyTorch CUDA available: {TORCH_AVAILABLE}, Device: {torch.cuda.get_device_name(0)}")
+        debug_log(f"PyTorch CUDA available: {torch.cuda.get_device_name(0)}")
     else:
-        debug_log("PyTorch CUDA not available")
+        debug_log("PyTorch CUDA not available, using CPU only.")
 except ImportError:
     TORCH_AVAILABLE = False
-    debug_log("PyTorch not installed, falling back to OpenCV only")
+    debug_log("PyTorch not installed, using CPU only.")
 
 # Global shutdown event used for both triggerbot and scanning logic
 shutdown_event = threading.Event()
@@ -121,82 +63,103 @@ def load_config(filename='config.json'):
     if os.path.exists(filename):
         try:
             with open(filename, 'r') as f:
-                return json.load(f)
+                config = json.load(f)
+                # Backward compatibility: map old keys to new ones
+                key_map = {
+                    "min_shooting_rate": "min_shooting_delay_ms",
+                    "max_shooting_rate": "max_shooting_delay_ms",
+                    "enable_press_duration": "enable_random_press_duration",
+                    "press_duration_min": "press_duration_min_s",
+                    "press_duration_max": "press_duration_max_s",
+                }
+                for old, new in key_map.items():
+                    if old in config and new not in config:
+                        config[new] = config[old]
+                # Remove deprecated keys
+                for deprecated in ["shooting_rate", "auto_fallback_to_cpu", "aim_lock_toggle_key"]:
+                    if deprecated in config:
+                        del config[deprecated]
+                # Ensure aim_lock_target_color is always an array
+                if "aim_lock_target_color" in config and not isinstance(config["aim_lock_target_color"], list):
+                    config["aim_lock_target_color"] = [30, 255, 255]
+                # Ensure all new aim lock keys are present
+                defaults = {
+                    "aim_lock_enabled": False,
+                    "aim_lock_target_color": [30, 255, 255],
+                    "aim_lock_tolerance": 45,
+                    "aim_lock_scan_area_x": 16,
+                    "aim_lock_scan_area_y": 10,
+                    "aim_lock_strength": 68,
+                    "aim_lock_refresh_rate": 240,
+                    "aim_lock_debug_mode": False,
+                    "aim_lock_adaptive_scan": True,
+                    "aim_lock_scan_pattern": "spiral"
+                }
+                for k, v in defaults.items():
+                    if k not in config:
+                        config[k] = v
+                return config
         except Exception:
             pass
-    # Default configuration with new press_duration and block movements option
+    # Default configuration with new schema
     return {
         "fov": 5.0,
         "keybind": 164,
-        "shooting_rate": 65.0,
-        "min_shooting_rate": 50.0,  # Minimum shooting delay in ms
-        "max_shooting_rate": 80.0,  # Maximum shooting delay in ms
+        "min_shooting_delay_ms": 50.0,  # Minimum shooting delay in ms
+        "max_shooting_delay_ms": 80.0,  # Maximum shooting delay in ms
         "fps": 200.0,
         "hsv_range": [[30, 125, 150], [30, 255, 255]],
         "trigger_mode": "hold",  # or "toggle"
-        "press_duration_min": 0.01,  # Minimum press duration in seconds
-        "press_duration_max": 0.05,  # Maximum press duration in seconds
-        "enable_press_duration": True,  # Toggle for using random press duration
+        "enable_random_press_duration": True,  # Toggle for using random press duration
+        "press_duration_min_s": 0.01,  # Minimum press duration in seconds
+        "press_duration_max_s": 0.05,  # Maximum press duration in seconds
         "block_movements": False,   # If True, block (W, A, S, D) while shooting
-        "use_gpu": CUDA_AVAILABLE,  # Use GPU if available
-        "auto_fallback_to_cpu": True,  # Auto fallback to CPU if GPU fails
+        "use_gpu": False,  # Use GPU if available
         "smart_acceleration": True,  # Automatically select best acceleration method
         "test_mode": False,  # Test mode for comparing GPU/CPU
-        "theme": "custom"  # Default theme set to custom green
+        "theme": "custom",  # Default theme set to custom green
+        # Aim Lock defaults
+        "aim_lock_enabled": False,
+        "aim_lock_target_color": [30, 255, 255],
+        "aim_lock_tolerance": 45,
+        "aim_lock_scan_area_x": 16,
+        "aim_lock_scan_area_y": 10,
+        "aim_lock_strength": 68,
+        "aim_lock_refresh_rate": 240,
+        "aim_lock_debug_mode": False,
+        "aim_lock_adaptive_scan": True,
+        "aim_lock_scan_pattern": "spiral"
     }
+
+def robust_load_config(filename='config.json'):
+    key_map = {
+        "Alt": 164, "Shift": 160, "Caps Lock": 20, "Tab": 9, "X": 0x58, "C": 0x43, "Z": 0x5A, "V": 0x56,
+        "Mouse Right": 0x02, "Mouse 3": 0x04, "Mouse 4": 0x05, "Mouse 5": 0x06
+    }
+    inv_key_map = {v: k for k, v in key_map.items()}
+    config = load_config(filename)
+    key_code = config.get('aim_lock_keybind', 164)
+    key_str = config.get('aim_lock_toggle_key', None)
+    if key_str is None and key_code is not None:
+        key_str = inv_key_map.get(key_code, 'Alt')
+        config['aim_lock_toggle_key'] = key_str
+        save_config(config, filename)
+    elif key_code is None and key_str is not None:
+        key_code = key_map.get(key_str, 164)
+        config['aim_lock_keybind'] = key_code
+        save_config(config, filename)
+    elif key_str is not None and key_code is not None:
+        if key_map.get(key_str, 164) != key_code:
+            config['aim_lock_keybind'] = key_map.get(key_str, 164)
+            save_config(config, filename)
+    return config
+
+# --- PATCH: Alias robust_load_config to load_config before MainWindow ---
+robust_load_config = load_config
 
 # ------------------- TriggerBot Logic -------------------
 
-def simulate_shoot(q, config):
-    keybd_event = ctypes.windll.user32.keybd_event
-    while not shutdown_event.is_set():
-        try:
-            # Use a small timeout to avoid blocking the loop but handle Empty exception silently
-            try:
-                signal_value = q.get(timeout=0.1)
-            except queue.Empty:
-                # This is normal - just wait for next signal
-                continue
-            
-            # Handle config update message
-            if signal_value == "UpdateConfig":
-                try:
-                    # Get the updated config from the queue
-                    updated_config = q.get(timeout=0.1)
-                    # Update the local config reference with the new values
-                    config.update(updated_config)
-                    debug_log("Shooting process config updated: " + 
-                             f"block_movements={config.get('block_movements', False)}, " +
-                             f"enable_press_duration={config.get('enable_press_duration', True)}, " +
-                             f"press_duration_min={config.get('press_duration_min', 0.01)}, " +
-                             f"press_duration_max={config.get('press_duration_max', 0.03)}")
-                    continue
-                except Exception as e:
-                    debug_log(f"Error updating config in shoot process: {type(e).__name__}: {str(e)}")
-                    continue
-            
-            if signal_value == "Shoot":
-                if config.get("enable_press_duration", True):
-                    press_duration_min = config.get("press_duration_min", 0.01)
-                    press_duration_max = config.get("press_duration_max", 0.05)
-                    press_duration = random.uniform(press_duration_min, press_duration_max)
-                else:
-                    press_duration = 0  # No delay if random press duration is disabled
-
-                # If blocking movements is enabled, release W, A, S, D keys
-                if config.get("block_movements", False):
-                    for key in [0x57, 0x41, 0x53, 0x44]:
-                        if win32api.GetAsyncKeyState(key) < 0:
-                            keybd_event(key, 0, 2, 0)  # simulate key up
-                keybd_event(0x01, 0, 0, 0)
-                time.sleep(press_duration)
-                keybd_event(0x01, 0, 2, 0)
-        except Exception as e:
-            error_info = f"{type(e).__name__}: {str(e)}"
-            debug_log(f"Error in shoot process: {error_info}")
-            # Print traceback for more detailed debugging
-            traceback.print_exc()
-            continue
+# Triggerbot functions were moved to triggerbot.py
 
 # Add a benchmark function to compare GPU vs CPU performance
 def benchmark_gpu_vs_cpu(frame):
@@ -234,7 +197,6 @@ def benchmark_gpu_vs_cpu(frame):
         # Dictionary to store results
         results = {
             "cpu_time": 0.0001,  # Small epsilon to prevent division by zero
-            "opencv_gpu_time": float('inf'),
             "pytorch_gpu_time": float('inf'),
             "best_gpu_time": float('inf'),
             "ratio": 0,
@@ -316,755 +278,50 @@ def benchmark_gpu_vs_cpu(frame):
         else:
             debug_log("PyTorch GPU benchmark skipped: CUDA not available")
         
-        # OpenCV GPU test (may not work if OpenCV isn't compiled with CUDA)
-        if OPENCV_HAS_CUDA and hasattr(cv2, 'cuda') and cv2.cuda.getCudaEnabledDeviceCount() > 0:
-            try:
-                debug_log("Running OpenCV GPU benchmark...")
-                opencv_gpu_start = time.time()
-                
-                for _ in range(test_iterations):
-                    # Upload to GPU
-                    gpu_frame = cv2.cuda_GpuMat()
-                    gpu_frame.upload(frame_large)
-                    
-                    # Convert to HSV on GPU
-                    gpu_hsv = cv2.cuda.cvtColor(gpu_frame, cv2.COLOR_RGB2HSV)
-                    
-                    # Try multiple operations to stress the GPU
-                    # Apply color thresholding
-                    for h in range(0, 180, 5):  # More color checks
-                        lower = cv2.cuda_GpuMat()
-                        upper = cv2.cuda_GpuMat()
-                        lower.upload(np.array([h, 50, 50], dtype=np.uint8))
-                        upper.upload(np.array([h+5, 255, 255], dtype=np.uint8))
-                        gpu_mask = cv2.cuda.inRange(gpu_hsv, lower, upper)
-                        
-                        # Add more GPU operations
-                        if h % 20 == 0:  # For some of the masks, do more processing
-                            # Apply morphological operations
-                            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-                            gpu_mask_dilated = cv2.cuda.dilate(gpu_mask, kernel)
-                            gpu_mask_eroded = cv2.cuda.erode(gpu_mask_dilated, kernel)
-                        
-                        # Download result (needed for practical use)
-                        mask_result = gpu_mask.download()
-                        has_color = np.any(mask_result)
-                        
-                        # Clean up
-                        lower.release()
-                        upper.release()
-                        gpu_mask.release()
-                        if h % 20 == 0:
-                            gpu_mask_dilated.release()
-                            gpu_mask_eroded.release()
-                    
-                    # Clean up
-                    gpu_frame.release()
-                    gpu_hsv.release()
-                
-                opencv_gpu_time = (time.time() - opencv_gpu_start) * 1000 / test_iterations
-                debug_log(f"OpenCV GPU average time: {opencv_gpu_time:.2f}ms")
-                results["opencv_gpu_time"] = max(opencv_gpu_time, 0.0001)  # Prevent zero
-                
-            except Exception as e:
-                debug_log(f"OpenCV GPU benchmark failed: {str(e)}")
-        else:
-            debug_log("OpenCV GPU benchmark skipped: CUDA not available in OpenCV")
-        
-        # CPU test (using OpenCV)
-        debug_log("Running OpenCV CPU benchmark...")
+        # CPU benchmark (same as the GPU operations but on CPU)
+        debug_log("Running CPU benchmark...")
         cpu_start = time.time()
         for _ in range(test_iterations):
-            hsv = cv2.cvtColor(frame_large, cv2.COLOR_RGB2HSV)
+            # Convert to HSV on CPU
+            hsv = cv2.cvtColor(frame_large, cv2.COLOR_BGR2HSV)
             
-            # Do multiple operations to match GPU workload
+            # Loop through hue ranges (same as GPU)
             for h in range(0, 180, 5):
-                # Create a test mask for each hue range
                 lower = np.array([h, 50, 50], dtype=np.uint8)
                 upper = np.array([h+5, 255, 255], dtype=np.uint8)
                 mask = cv2.inRange(hsv, lower, upper)
-                has_color = np.any(mask)
-                
-                # Add more operations to match GPU workload
-                if h % 20 == 0:
-                    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-                    mask_dilated = cv2.dilate(mask, kernel)
-                    mask_eroded = cv2.erode(mask_dilated, kernel)
+                count = cv2.countNonZero(mask)
         
         cpu_time = (time.time() - cpu_start) * 1000 / test_iterations
         debug_log(f"CPU average time: {cpu_time:.2f}ms")
         results["cpu_time"] = max(cpu_time, 0.0001)  # Prevent zero
         
-        # Determine best GPU method
-        best_gpu_time = min(results["opencv_gpu_time"], results["pytorch_gpu_time"])
+        # Determine best GPU time and ratio
+        best_gpu_time = min(results["pytorch_gpu_time"], results["cpu_time"])
         results["best_gpu_time"] = best_gpu_time
+        results["ratio"] = results["cpu_time"] / best_gpu_time if best_gpu_time < float('inf') else 0
         
-        if best_gpu_time == results["pytorch_gpu_time"] and results["pytorch_gpu_time"] < float('inf'):
-            results["best_method"] = "PyTorch GPU"
-        elif best_gpu_time == results["opencv_gpu_time"] and results["opencv_gpu_time"] < float('inf'):
-            results["best_method"] = "OpenCV GPU"
+        # Determine best method based on ratio
+        if results["ratio"] > 1.0:
+            # GPU is faster, determine which one
+            if results["pytorch_gpu_time"] <= results["cpu_time"]:
+                results["best_method"] = "GPU-PyTorch"
+            else:
+                results["best_method"] = "CPU"
         else:
             results["best_method"] = "CPU"
         
-        # Calculate speedup ratio with protection against div by 0
-        if best_gpu_time < float('inf'):
-            if best_gpu_time > 0:
-                results["ratio"] = results["cpu_time"] / best_gpu_time
-            else:
-                results["ratio"] = 100  # Arbitrarily large if GPU time is zero/near-zero
-                
-            if results["ratio"] > 1:
-                debug_log(f"{results['best_method']} is {results['ratio']:.2f}x faster than CPU")
-            else:
-                slowdown = 1.0 / max(results["ratio"], 0.0001)  # Avoid div by 0
-                debug_log(f"WARNING: {results['best_method']} is {slowdown:.2f}x SLOWER than CPU!")
-        else:
-            results["ratio"] = 0
-            debug_log("No GPU methods available for comparison")
-        
-        # Log complete results
-        debug_log(f"Benchmark complete: CPU={results['cpu_time']:.2f}ms, PyTorch={results['pytorch_gpu_time']:.2f}ms, OpenCV GPU={results['opencv_gpu_time']:.2f}ms")
-        debug_log(f"Best method: {results['best_method']}")
+        debug_log(f"Benchmark completed - CPU: {results['cpu_time']:.2f}ms, Best GPU: {best_gpu_time:.2f}ms, Ratio: {results['ratio']:.2f}x, Best method: {results['best_method']}")
         
         return results
         
     except Exception as e:
         debug_log(f"Error during benchmark: {str(e)}")
         traceback.print_exc()
-        return {"cpu_time": 0.0001, "opencv_gpu_time": float('inf'), "pytorch_gpu_time": float('inf'), 
-                "best_gpu_time": float('inf'), "ratio": 0, "best_method": "CPU (benchmark failed)"}
+        return {"cpu_time": 0.0001, "pytorch_gpu_time": float('inf'), "best_gpu_time": float('inf'), 
+                "ratio": 0, "best_method": "CPU (benchmark failed)"}
 
-# Add a new function for PyTorch-based color detection right before the detect_color function
-def detect_color_pytorch(frame, cmin, cmax):
-    """
-    Detect if the specified color range exists in the frame using PyTorch with CUDA.
-    This is a dedicated PyTorch implementation optimized for GPU performance.
-    
-    Args:
-        frame: The image frame to check (numpy array)
-        cmin: Minimum HSV values [h_min, s_min, v_min]
-        cmax: Maximum HSV values [h_max, s_max, v_max]
-    
-    Returns:
-        Boolean indicating if the color was detected, None if error occurred
-    """
-    if not TORCH_AVAILABLE or not torch.cuda.is_available():
-        return None
-        
-    try:
-        h_min, s_min, v_min = cmin
-        h_max, s_max, v_max = cmax
-        
-        # Use non-blocking transfer for better performance
-        with torch.amp.autocast('cuda', enabled=True):  # Using updated API syntax
-            # Convert to PyTorch tensor and move to GPU - use non-blocking for better performance
-            frame_tensor = torch.from_numpy(frame).cuda(non_blocking=True).float() / 255.0
-            
-            # Get the dimensions of the tensor
-            if len(frame_tensor.shape) == 3:  # [H, W, C]
-                # Reorder channels from [H, W, C] to [C, H, W]
-                frame_tensor = frame_tensor.permute(2, 0, 1)
-            
-            # Extract RGB channels
-            if frame_tensor.shape[0] == 3:  # Ensure we have 3 channels
-                r, g, b = frame_tensor[0], frame_tensor[1], frame_tensor[2]
-                
-                # Calculate HSV values using PyTorch operations
-                max_val, _ = torch.max(frame_tensor, dim=0)
-                min_val, _ = torch.min(frame_tensor, dim=0)
-                diff = max_val - min_val
-                
-                # Value is max_val
-                v = max_val
-                
-                # Saturation is diff / max_val (or 0 if max_val is 0)
-                s = torch.where(max_val != 0, diff / max_val, torch.zeros_like(max_val))
-                
-                # Hue calculation
-                h = torch.zeros_like(max_val)
-                
-                # Create masks for different max channels
-                r_max_mask = (r == max_val) & (diff != 0)
-                g_max_mask = (g == max_val) & (diff != 0)
-                b_max_mask = (b == max_val) & (diff != 0)
-                
-                # Calculate hue based on which channel is max
-                h[r_max_mask] = (60 * ((g[r_max_mask] - b[r_max_mask]) / diff[r_max_mask]) + 360) % 360
-                h[g_max_mask] = (60 * ((b[g_max_mask] - r[g_max_mask]) / diff[g_max_mask]) + 120)
-                h[b_max_mask] = (60 * ((r[b_max_mask] - g[b_max_mask]) / diff[b_max_mask]) + 240)
-                
-                # Scale to OpenCV ranges [0-179, 0-255, 0-255]
-                h = h / 2  # OpenCV uses [0, 179] for Hue
-                s = s * 255
-                v = v * 255
-                
-                # Create a binary mask where values are in the target color range
-                mask = (h >= h_min) & (h <= h_max) & (s >= s_min) & (s <= s_max) & (v >= v_min) & (v <= v_max)
-                
-                # Check if any values in mask are True - use .any() for best performance
-                # Only synchronize at this final step
-                result = torch.any(mask).item()
-            
-                # Force CUDA to complete all operations
-                torch.cuda.synchronize()
-        
-        # Only do cleanup if we're experiencing memory pressure (no need for every frame)
-        if torch.cuda.memory_allocated() > 0.8 * torch.cuda.max_memory_allocated():
-            del frame_tensor, r, g, b, max_val, min_val, diff, v, s, h, r_max_mask, g_max_mask, b_max_mask, mask
-            torch.cuda.empty_cache()
-        
-        return result
-        
-    except Exception as e:
-        debug_log(f"PyTorch color detection error: {str(e)}")
-        # Clean up and release CUDA memory on error
-        try:
-            torch.cuda.empty_cache()
-        except:
-            pass
-        return None
-
-def detect_color(frame, cmin, cmax, use_gpu=False, triggerbot=None, force_cpu_mode=False):
-    """
-    Detect if the specified color range exists in the frame.
-    
-    Args:
-        frame: The image frame to check
-        cmin: Minimum HSV values [h_min, s_min, v_min]
-        cmax: Maximum HSV values [h_max, s_max, v_max]
-        use_gpu: Whether to use GPU acceleration
-        triggerbot: Reference to the Triggerbot instance for auto-fallback
-        force_cpu_mode: If True, always use CPU mode (for testing)
-    
-    Returns:
-        Boolean indicating if the color was detected
-    """
-    if frame is None:
-        debug_log("detect_color: Frame is None")
-        return False
-    
-    start_time = time.time()
-    result = False
-    mode_used = "CPU"
-    
-    # Try PyTorch GPU method if GPU is enabled and not forced to CPU
-    if use_gpu and not force_cpu_mode:
-        # Attempt PyTorch detection (optimized GPU method)
-        if TORCH_AVAILABLE and torch.cuda.is_available():
-            debug_log("Attempting PyTorch GPU detection")
-            torch_result = detect_color_pytorch(frame, cmin, cmax)
-            
-            if torch_result is not None:
-                result = torch_result
-                mode_used = "GPU-PyTorch"
-                process_time = (time.time() - start_time) * 1000
-                debug_log(f"PyTorch GPU detection result: {result}, took {process_time:.2f}ms")
-                
-                # Reset GPU failure count on success
-                if triggerbot is not None:
-                    triggerbot.gpu_failure_count = 0
-                
-                return result
-            else:
-                debug_log("PyTorch detection failed, trying OpenCV")
-                
-                # Track failures for auto-fallback
-                if triggerbot is not None:
-                    triggerbot.gpu_failure_count += 1
-    
-    # If we got here, either GPU mode is disabled, force_cpu_mode is True,
-    # or the PyTorch method failed, so use OpenCV CPU method
-    try:
-        debug_log("Using OpenCV CPU color detection")
-        hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
-        mask = cv2.inRange(hsv, np.array(cmin, dtype=np.uint8), np.array(cmax, dtype=np.uint8))
-        result = np.any(mask)
-        mode_used = "CPU-OpenCV"
-        
-        # Auto-fallback to CPU if too many GPU failures
-        if triggerbot is not None and triggerbot.auto_fallback and triggerbot.gpu_failure_count >= triggerbot.max_gpu_failures:
-            debug_log(f"Too many GPU failures ({triggerbot.gpu_failure_count}). Switching to CPU mode permanently.")
-            triggerbot.use_gpu = False
-    except Exception as e:
-        debug_log(f"Error in OpenCV CPU color detection: {e}")
-        return False
-    
-    process_time = (time.time() - start_time) * 1000
-    debug_log(f"{mode_used} color detection result: {result}, took {process_time:.2f}ms")
-    return result
-
-class Triggerbot:
-    def __init__(self, q, settings, fov, hsv_range, shooting_rate, fps):
-        self.queue = q
-        self.settings = settings  # shared config dictionary
-        self.shooting_rate = shooting_rate / 1000.0
-        
-        # Initialize min/max shooting rates
-        self.min_shooting_rate = settings.get("min_shooting_rate", 50.0) / 1000.0
-        self.max_shooting_rate = settings.get("max_shooting_rate", 80.0) / 1000.0
-        
-        self.fps = int(fps)
-        self.fov = int(fov)
-        self.hsv_range = hsv_range
-        self.frames_processed = 0
-        self.last_shot_time = 0
-        self.check_region = None
-        self.camera = None
-        self.stop_flag = False
-        self.paused = False
-        self.region_changed = True  # Force region update on startup
-        self.use_gpu = settings.get("use_gpu", False) and CUDA_AVAILABLE
-        self.auto_fallback = settings.get("auto_fallback_to_cpu", True)
-        self.test_mode = settings.get("test_mode", False)
-        self.max_gpu_failures = 3
-        self.gpu_failure_count = 0
-        self.config_updated = False
-        self.force_cpu_mode = False  # Add the missing attribute
-        self.camera_lock = threading.Lock()  # Add lock for thread-safe camera access
-        
-        # Get screen dimensions for center calculation
-        user32 = ctypes.windll.user32
-        self.WIDTH, self.HEIGHT = user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
-        
-        # Parse HSV range
-        cmin = self.hsv_range[0]
-        cmax = self.hsv_range[1]
-        self.cmin = cmin
-        self.cmax = cmax
-        
-        self.update_config_lock = threading.Lock()
-        
-        # Initialize check region and camera
-        self.update_check_region()
-        
-        # Start with a valid camera
-        try:
-            self.camera = bettercam.create(output_idx=0, region=self.check_region)
-            self.camera.start(target_fps=self.fps)
-            debug_log(f"Camera created with initial region: {self.check_region}")
-        except Exception as e:
-            debug_log(f"Error creating initial camera: {e}")
-            traceback.print_exc()
-        
-        debug_log(f"Triggerbot initialized with GPU={self.use_gpu}, Auto-fallback={self.auto_fallback}")
-
-    def update_check_region(self):
-        """Update the region to check based on the current FOV"""
-        try:
-            # Calculate region based on FOV and screen center
-            center_x, center_y = self.WIDTH // 2, self.HEIGHT // 2
-            
-            # Use the full FOV value, not half
-            fov_size = max(4, self.fov)  # Ensure at least 4 pixels for detection
-            
-            left = center_x - fov_size
-            top = center_y - fov_size
-            right = center_x + fov_size
-            bottom = center_y + fov_size
-            
-            # Clamp to screen bounds
-            left = max(0, left)
-            top = max(0, top)
-            right = min(self.WIDTH, right)
-            bottom = min(self.HEIGHT, bottom)
-            
-            # Save the new region
-            self.check_region = (left, top, right, bottom)
-            debug_log(f"Updated check region to {self.check_region}")
-            
-            # Don't automatically update the camera here
-            # Just set the flag so the main loop will recreate it
-            self.region_changed = True
-            
-        except Exception as e:
-            debug_log(f"Error updating check region: {e}")
-            traceback.print_exc()
-
-    def update_hsv_range(self, hsv_range):
-        """Update HSV range used for color detection"""
-        self.hsv_range = hsv_range
-        self.cmin = hsv_range[0]
-        self.cmax = hsv_range[1]
-        debug_log(f"Updated HSV range to {hsv_range}")
-        
-        # Immediately apply the change
-        self.config_updated = True
-    
-    def update_config(self, settings):
-        with self.update_config_lock:
-            # Store old FOV to check if it changed
-            old_fov = self.fov
-            
-            # Update settings
-            self.settings = settings
-            self.fov = int(settings.get("fov", 5.0))
-            
-            # Update shooting rate with min and max values
-            min_shooting_rate = settings.get("min_shooting_rate", 50.0) / 1000.0
-            max_shooting_rate = settings.get("max_shooting_rate", 80.0) / 1000.0
-            self.min_shooting_rate = min_shooting_rate
-            self.max_shooting_rate = max_shooting_rate
-            # Keep for backward compatibility
-            self.shooting_rate = settings.get("shooting_rate", 65.0) / 1000.0
-            
-            self.use_gpu = settings.get("use_gpu", False) and CUDA_AVAILABLE
-            self.auto_fallback = settings.get("auto_fallback_to_cpu", True)
-            
-            # Log important setting changes for debugging
-            block_movements = settings.get("block_movements", False)
-            enable_press_duration = settings.get("enable_press_duration", True)
-            press_min = settings.get("press_duration_min", 0.01)
-            press_max = settings.get("press_duration_max", 0.05)
-            debug_log(f"Triggerbot settings updated: block_movements={block_movements}, enable_press_duration={enable_press_duration}, press_min={press_min}, press_max={press_max}")
-            debug_log(f"Shooting rate range: {min_shooting_rate*1000:.0f}ms - {max_shooting_rate*1000:.0f}ms")
-            
-            # Special settings for test mode
-            if hasattr(self, 'test_mode'):
-                self.test_mode = settings.get("test_mode", False)
-                if self.test_mode:
-                    debug_log("TEST MODE ENABLED: Will alternate between GPU and CPU for performance testing")
-            
-            debug_log(f"Config updated: GPU={self.use_gpu}, Auto-fallback={self.auto_fallback}")
-            
-            # Only update check region if FOV changed
-            if old_fov != self.fov:
-                debug_log(f"FOV changed from {old_fov} to {self.fov}, updating region immediately")
-                self.update_check_region()
-                self.region_changed = False  # Reset since we've already updated
-            
-            self.update_hsv_range(settings.get("hsv_range", [[30,125,150],[30,255,255]]))
-            self.config_updated = True
-
-    def run(self):
-        """Main triggerbot thread that runs continuously"""
-        try:
-            debug_log("TriggerBot thread started")
-            frames_processed = 0
-            color_detected_count = 0
-            fps_counter = 0
-            last_fps_check = time.time()
-            
-            # For test mode
-            cpu_frames = 0
-            gpu_frames = 0
-            cpu_time_total = 0
-            gpu_time_total = 0
-            
-            # For auto-benchmarking
-            last_benchmark_time = time.time()
-            benchmark_complete = False
-            best_method = "CPU"
-            
-            # Initialize with default settings
-            use_gpu = self.use_gpu
-            force_cpu = self.force_cpu_mode
-            
-            # Initialize camera
-            if not hasattr(self, 'camera') or self.camera is None:
-                try:
-                    self.camera = bettercam.create(output_idx=0, region=self.check_region)
-                    self.camera.start(target_fps=self.fps)
-                    debug_log(f"Initial camera created with region: {self.check_region}")
-                except Exception as e:
-                    debug_log(f"Error creating initial camera: {e}")
-            
-            while not self.stop_flag and not shutdown_event.is_set():
-                # Safely get current settings
-                with self.update_config_lock:
-                    current_key = self.settings.get("keybind", 164)
-                    mode = self.settings.get("trigger_mode", "hold")
-                    self.config_updated = False
-                
-                # Determine if active based on trigger mode
-                if mode == "hold":
-                    active = (win32api.GetAsyncKeyState(current_key) < 0) and not self.paused
-                else:  # Toggle mode
-                    current_state = (win32api.GetAsyncKeyState(current_key) < 0)
-                    if current_state and not getattr(self, 'last_key_state', False):
-                        self.toggled_active = not getattr(self, 'toggled_active', False)
-                        debug_log(f"Toggle mode switched to: {self.toggled_active}")
-                        time.sleep(0.3)  # debounce delay
-                    self.last_key_state = current_state
-                    active = getattr(self, 'toggled_active', False) and not self.paused
-                
-                # Update region if changed - correctly recreate camera
-                if self.region_changed:
-                    debug_log(f"Region change detected - recreating camera with new region: {self.check_region}")
-                    try:
-                        # Stop old camera if it exists
-                        if self.camera:
-                            try:
-                                self.camera.stop()
-                            except:
-                                pass
-                        
-                        # Delete reference to old camera before creating new one
-                        # This is important for bettercam which checks if an instance exists
-                        self.camera = None
-                        time.sleep(0.2)  # Small delay to ensure resources are released
-                        
-                        # Create new camera with updated region
-                        self.camera = bettercam.create(output_idx=0, region=self.check_region)
-                        self.camera.start(target_fps=self.fps)
-                        debug_log(f"Camera recreated with region: {self.check_region}")
-                    except Exception as e:
-                        debug_log(f"Error recreating camera: {e}")
-                    
-                    self.region_changed = False
-
-                if active:
-                    # Get frame safely
-                    frame = None
-                    if self.camera:
-                        try:
-                            frame = self.camera.get_latest_frame()
-                        except Exception as e:
-                            debug_log(f"Error getting frame: {e}")
-                            # Clear camera reference so we'll recreate it next time
-                            try:
-                                if self.camera:
-                                    self.camera.stop()
-                                self.camera = None
-                            except:
-                                pass
-                    
-                    if frame is not None:
-                        self.frames_processed += 1
-                        frames_processed += 1
-                        
-                        # Run benchmark periodically (every 10 minutes) or if user changes GPU settings
-                        current_time = time.time()
-                        if not benchmark_complete or self.config_updated or current_time - last_benchmark_time > 600:
-                            # Use fast benchmark for runtime checks to avoid lag
-                            debug_log("Running quick performance check...")
-                            benchmark_results = fast_benchmark(frame)
-                            best_method = benchmark_results["best_method"]
-                            
-                            # Auto-select best mode if auto fallback is enabled
-                            if self.auto_fallback:
-                                if best_method == "GPU" and benchmark_results["ratio"] > 1.2:
-                                    if not use_gpu:
-                                        debug_log(f"Auto-switching to GPU mode (GPU is {benchmark_results['ratio']:.2f}x faster)")
-                                        self.use_gpu = True
-                                        use_gpu = True
-                                elif benchmark_results["ratio"] < 1.0:
-                                    if use_gpu:
-                                        debug_log(f"Auto-switching to CPU mode (GPU is slower, ratio: {benchmark_results['ratio']:.2f}x)")
-                                        self.use_gpu = False
-                                        use_gpu = False
-                            
-                            benchmark_complete = True
-                            last_benchmark_time = current_time
-                            self.config_updated = False
-                        
-                        # Color detection
-                        start_time = time.time()
-                        color_detected = detect_color(frame, self.cmin, self.cmax, use_gpu, self, force_cpu)
-                        elapsed = (time.time() - start_time) * 1000
-                        
-                        # Track stats for test mode
-                        if self.test_mode:
-                            if force_cpu:
-                                cpu_frames += 1
-                                cpu_time_total += elapsed
-                            else:
-                                gpu_frames += 1
-                                gpu_time_total += elapsed
-                        
-                        if color_detected:
-                            color_detected_count += 1
-                            debug_log(f"Target color detected (frame #{frames_processed})!")
-                            current_time = time.time()
-                            # Use random delay between min and max
-                            random_delay = random.uniform(self.min_shooting_rate, self.max_shooting_rate)
-                            if current_time - self.last_shot_time >= random_delay:
-                                debug_log(f"Shoot signal sent (delay: {random_delay*1000:.0f}ms)")
-                                self.queue.put("Shoot")
-                                self.last_shot_time = current_time
-                        else:
-                            debug_log("Failed to get frame from camera")
-                            
-                        time.sleep(1 / self.fps)
-                else:
-                    time.sleep(0.01)
-                    
-                # Calculate and print FPS every 5 seconds
-                fps_counter += 1
-                if time.time() - last_fps_check >= 5:
-                    elapsed = time.time() - last_fps_check
-                    fps = fps_counter / elapsed
-                    debug_log(f"TriggerBot FPS: {fps:.1f}, Frames processed: {frames_processed}, Color detections: {color_detected_count}")
-                    debug_log(f"Current acceleration mode: {best_method if use_gpu else 'CPU'}")
-                    
-                    # Show test mode stats if active
-                    if self.test_mode and (gpu_frames > 0 or cpu_frames > 0):
-                        gpu_avg = gpu_time_total / gpu_frames if gpu_frames > 0 else 0
-                        cpu_avg = cpu_time_total / cpu_frames if cpu_frames > 0 else 0
-                        debug_log(f"TEST MODE STATS - GPU: {gpu_avg:.2f}ms ({gpu_frames} frames), CPU: {cpu_avg:.2f}ms ({cpu_frames} frames)")
-                    
-                    # Reset counters
-                    fps_counter = 0
-                    last_fps_check = time.time()
-                    
-            debug_log("TriggerBot thread stopped")
-        except Exception as e:
-            debug_log(f"Error in TriggerBot thread: {str(e)}")
-            traceback.print_exc()
-
-    def stop(self):
-        debug_log("Stopping TriggerBot...")
-        self.stop_flag = True
-        with self.camera_lock:
-            if self.camera:
-                try:
-                    self.camera.stop()
-                    self.camera = None
-                except:
-                    pass
-        debug_log("TriggerBot stopped")
-
-    def update_config(self, settings):
-        with self.update_config_lock:
-            # Store old FOV to check if it changed
-            old_fov = self.fov
-            
-            # Update settings
-            self.settings = settings
-            self.fov = int(settings.get("fov", 5.0))
-            
-            # Update shooting rate with min and max values
-            min_shooting_rate = settings.get("min_shooting_rate", 50.0) / 1000.0
-            max_shooting_rate = settings.get("max_shooting_rate", 80.0) / 1000.0
-            self.min_shooting_rate = min_shooting_rate
-            self.max_shooting_rate = max_shooting_rate
-            # Keep for backward compatibility
-            self.shooting_rate = settings.get("shooting_rate", 65.0) / 1000.0
-            
-            self.use_gpu = settings.get("use_gpu", False) and CUDA_AVAILABLE
-            self.auto_fallback = settings.get("auto_fallback_to_cpu", True)
-            
-            # Log important setting changes for debugging
-            block_movements = settings.get("block_movements", False)
-            enable_press_duration = settings.get("enable_press_duration", True)
-            press_min = settings.get("press_duration_min", 0.01)
-            press_max = settings.get("press_duration_max", 0.05)
-            debug_log(f"Triggerbot settings updated: block_movements={block_movements}, enable_press_duration={enable_press_duration}, press_min={press_min}, press_max={press_max}")
-            debug_log(f"Shooting rate range: {min_shooting_rate*1000:.0f}ms - {max_shooting_rate*1000:.0f}ms")
-            
-            # Special settings for test mode
-            if hasattr(self, 'test_mode'):
-                self.test_mode = settings.get("test_mode", False)
-                if self.test_mode:
-                    debug_log("TEST MODE ENABLED: Will alternate between GPU and CPU for performance testing")
-            
-            debug_log(f"Config updated: GPU={self.use_gpu}, Auto-fallback={self.auto_fallback}")
-            
-            # Only update check region if FOV changed
-            if old_fov != self.fov:
-                debug_log(f"FOV changed from {old_fov} to {self.fov}, updating region immediately")
-                self.update_check_region()
-                self.region_changed = False  # Reset since we've already updated
-            
-            self.update_hsv_range(settings.get("hsv_range", [[30,125,150],[30,255,255]]))
-            self.config_updated = True
-
-    def update_gpu_config(self):
-        # Update GPU config (now inverted - checkbox ON means CPU mode)
-        use_gpu = self.use_gpu_checkbox.isChecked()
-        self.config["use_gpu"] = use_gpu
-        save_config(self.config)
-        
-        # Update the triggerbot if running
-        if hasattr(self, 'trigger_bot_thread') and self.trigger_bot_thread and self.trigger_bot_thread.isRunning():
-            self.trigger_bot_thread.update_config(self.config)
-            
-            # Force immediate GPU config update
-            if hasattr(self.trigger_bot_thread, 'triggerbot') and self.trigger_bot_thread.triggerbot:
-                triggerbot = self.trigger_bot_thread.triggerbot
-                
-                # Signal that config needs to be reloaded on next processing cycle
-                triggerbot.config_updated = True
-                triggerbot.use_gpu = use_gpu
-                
-                self.log(f"GPU acceleration {'enabled' if use_gpu else 'disabled'} - applied immediately")
-        else:
-            self.log(f"GPU acceleration {'enabled' if use_gpu else 'disabled'} - will apply on next start")
-        
-        # If enabling GPU, suggest running a benchmark
-        if use_gpu:
-            self.log("Consider running a benchmark to verify GPU performance")
-
-class TriggerBotThread(QtCore.QThread):
-    log_signal = QtCore.pyqtSignal(str)
-    def __init__(self, settings, fov, shooting_rate, fps, hsv_range, parent=None):
-        super().__init__(parent)
-        self.settings = settings
-        self.fov = fov
-        self.shooting_rate = shooting_rate
-        self.min_shooting_rate = settings.get("min_shooting_rate", 50.0)
-        self.max_shooting_rate = settings.get("max_shooting_rate", 80.0)
-        self.fps = fps
-        self.hsv_range = hsv_range
-        self.triggerbot = None
-        self.shoot_queue = Queue()
-        self.shoot_process = None
-        self.config_lock = threading.Lock()
-
-    def run(self):
-        # Start the shooting process
-        self.shoot_process = Process(target=simulate_shoot, args=(self.shoot_queue, self.settings))
-        self.shoot_process.start()
-        
-        # Create and run the triggerbot
-        self.triggerbot = Triggerbot(self.shoot_queue, self.settings, self.fov, self.hsv_range, self.shooting_rate, self.fps)
-        self.triggerbot.run()
-
-    def update_config(self, settings):
-        with self.config_lock:
-            self.settings = settings
-            self.fov = settings.get("fov", 5.0)
-            self.shooting_rate = settings.get("shooting_rate", 65.0)
-            self.min_shooting_rate = settings.get("min_shooting_rate", 50.0)
-            self.max_shooting_rate = settings.get("max_shooting_rate", 80.0)
-            self.hsv_range = settings.get("hsv_range", [[30,125,150],[30,255,255]])
-            
-            # Update triggerbot if running
-            if self.triggerbot:
-                self.triggerbot.update_config(settings)
-                self.log_signal.emit("TriggerBot settings updated")
-            
-            # Send settings update to the shoot process
-            try:
-                # Pass updated settings to the shooting process
-                self.shoot_queue.put("UpdateConfig")  # Signal that config will be updated
-                self.shoot_queue.put(settings)  # Send the actual config
-                self.log_signal.emit("Shooting process settings updated")
-            except Exception as e:
-                self.log_signal.emit(f"Error updating shooting process: {str(e)}")
-
-    def stop(self):
-        try:
-            # Signal the global shutdown
-            shutdown_event.set()
-            
-            # Stop the triggerbot
-            if self.triggerbot:
-                self.triggerbot.stop_flag = True
-                if hasattr(self.triggerbot, 'camera') and self.triggerbot.camera:
-                    try:
-                        self.triggerbot.camera.stop()
-                    except:
-                        pass
-            
-            # Stop the shoot process
-            if self.shoot_process and self.shoot_process.is_alive():
-                self.shoot_process.terminate()
-                self.shoot_process.join(timeout=1.0)
-                
-            # Terminate this thread
-            self.terminate()
-        except Exception as e:
-            debug_log(f"Error stopping TriggerBotThread: {e}")
+# TriggerBot related functions have been moved to triggerbot.py
 
 # ------------------- New Agent Locking (Instalock) Logic -------------------
 # UI-DO-NOT-OBFUSCATE-START
@@ -1146,6 +403,7 @@ class ScanningWorker(QtCore.QThread):
 # ------------------- Modern UI (Redesigned) -------------------
 
 class MainWindow(QtWidgets.QMainWindow):
+    profile_shortcut_signal = QtCore.pyqtSignal(str)
     def __init__(self):
         super().__init__()
         # Apply modern style
@@ -1165,7 +423,11 @@ class MainWindow(QtWidgets.QMainWindow):
             "Mouse 4": 0x05,
             "Mouse 5": 0x06
         }
-        self.config = load_config()
+        self.config = robust_load_config()
+        
+        # Ensure aim_lock_toggle_key exists and is lowercase for keyboard detection
+        if 'aim_lock_toggle_key' in self.config:
+            self.config['aim_lock_toggle_key'] = self.config['aim_lock_toggle_key'].lower()
         
         # Set window title randomly from the provided names list
         names = [
@@ -1187,6 +449,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.trigger_bot_thread = None
         self.worker = None
         
+        self.aim_lock_controller = AimLockController(self.config)
+        # self.aim_lock_status_timer = QtCore.QTimer(self)
+        # self.aim_lock_status_timer.timeout.connect(self.update_aim_lock_status_ui)
+        # self.aim_lock_status_timer.start(500)
+        
         self.init_ui()
         
         # Status bar with GPU info
@@ -1198,6 +465,11 @@ class MainWindow(QtWidgets.QMainWindow):
             
         # Set theme based on config (now defaulting to custom green)
         self.apply_theme(self.config.get("theme", "custom"))
+
+        # --- FIX: Ensure AimLockController is started if enabled on load ---
+        if self.aim_lock_enabled_checkbox.isChecked():
+            self.aim_lock_controller.update_config(self.config)
+            self.aim_lock_controller.start()
 
     def init_ui(self):
         # Main widget and layout
@@ -1211,7 +483,7 @@ class MainWindow(QtWidgets.QMainWindow):
         header = QtWidgets.QFrame()
         header.setFixedHeight(60)
         header_layout = QtWidgets.QHBoxLayout(header)
-        header_label = QtWidgets.QLabel("GamerFun Valo Menu V3")
+        header_label = QtWidgets.QLabel("GamerFun Valo Menu V4")
         header_label.setStyleSheet("font-size: 20px; font-weight: bold;")
         header_layout.addWidget(header_label)
         
@@ -1227,29 +499,37 @@ class MainWindow(QtWidgets.QMainWindow):
         theme_layout.addWidget(theme_label)
         theme_layout.addWidget(self.theme_combo)
         header_layout.addLayout(theme_layout)
-        
         main_layout.addWidget(header)
         
         # Create tab widget
         self.tabs = QTabWidget()
+        self.tabs.setTabPosition(QTabWidget.North)
+        self.tabs.setMovable(False)
+        self.tabs.setStyleSheet("QTabBar::tab { min-width: 120px; min-height: 28px; font-size: 14px; }")
         
         # Create tabs
         self.instalock_tab = QtWidgets.QWidget()
         self.triggerbot_tab = QtWidgets.QWidget()
+        self.profiling_tab = QtWidgets.QWidget()
+        self.aimlock_tab = QtWidgets.QWidget()
         self.settings_tab = QtWidgets.QWidget()
         self.logs_tab = QtWidgets.QWidget()
         
-        # Add tabs to widget
-        self.tabs.addTab(self.instalock_tab, "Agent Instalock")
-        self.tabs.addTab(self.triggerbot_tab, "TriggerBot")
-        self.tabs.addTab(self.settings_tab, "Settings")
-        self.tabs.addTab(self.logs_tab, "Logs")
+        # Add tabs to widget in improved order
+        self.tabs.addTab(self.instalock_tab, "🕹️ Agent Instalock")
+        self.tabs.addTab(self.triggerbot_tab, "🎯 TriggerBot")
+        self.tabs.addTab(self.profiling_tab, "🗂️ Profiling")
+        self.tabs.addTab(self.aimlock_tab, "🎯 Aim Lock")
+        self.tabs.addTab(self.settings_tab, "⚙️ Settings")
+        self.tabs.addTab(self.logs_tab, "📜 Logs")
         
         main_layout.addWidget(self.tabs)
         
         # Setup each tab
         self.setup_instalock_tab()
         self.setup_triggerbot_tab()
+        self.setup_profiling_tab()
+        self.setup_aimlock_tab()
         self.setup_settings_tab()
         self.setup_logs_tab()
         
@@ -1263,6 +543,10 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Activate triggerbot on startup if checkbox is checked
         QtCore.QTimer.singleShot(500, self.activate_triggerbot_on_startup)
+        
+        # Set a reasonable default window size
+        self.resize(1100, 800)
+        self.setMinimumSize(900, 600)
 
     def activate_triggerbot_on_startup(self):
         """Activate triggerbot on startup if the checkbox is checked"""
@@ -1320,7 +604,7 @@ class MainWindow(QtWidgets.QMainWindow):
         enabled = (state == QtCore.Qt.Checked)
         self.press_duration_min_spin.setEnabled(enabled)
         self.press_duration_max_spin.setEnabled(enabled)
-        self.config["enable_press_duration"] = enabled
+        self.config["enable_random_press_duration"] = enabled
         save_config(self.config)
         
         # Update active triggerbot if running, so changes take effect immediately
@@ -1347,7 +631,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """Update configuration and apply changes to running triggerbot if active"""
         # Get the old FOV value before updating config
         old_fov = self.config.get("fov", 5.0)
-        new_fov = self.fov_spin.value()
+        new_fov = self.fov_slider.value()
         
         # Update configuration
         self.config["fov"] = new_fov
@@ -1362,13 +646,13 @@ class MainWindow(QtWidgets.QMainWindow):
             max_rate = min_rate
             self.max_delay_spin.setValue(max_rate)
         
-        self.config["min_shooting_rate"] = min_rate
-        self.config["max_shooting_rate"] = max_rate
+        self.config["min_shooting_delay_ms"] = min_rate
+        self.config["max_shooting_delay_ms"] = max_rate
         self.config["shooting_rate"] = (min_rate + max_rate) / 2  # Average for backward compatibility
         
-        self.config["press_duration_min"] = self.press_duration_min_spin.value()
-        self.config["press_duration_max"] = self.press_duration_max_spin.value()
-        self.config["enable_press_duration"] = self.press_duration_toggle.isChecked()
+        self.config["press_duration_min_s"] = self.press_duration_min_spin.value()
+        self.config["press_duration_max_s"] = self.press_duration_max_spin.value()
+        self.config["enable_random_press_duration"] = self.press_duration_toggle.isChecked()
         self.config["block_movements"] = self.block_movements_checkbox.isChecked()
         
         # Save the updated configuration
@@ -1394,10 +678,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 # Force FOV update explicitly - ensure it's an integer
                 triggerbot.fov = int(new_fov)  # Cast to int
                 
-                # We need to explicitly stop and recreate the camera because 
-                # of how the triggerbot's run loop may not detect the region_changed flag quickly
+                # Update the check region based on new FOV
                 try:
-                    debug_log("FOV changed - forcing immediate camera recreation")
+                    debug_log("FOV changed - forcing immediate check region update")
                     
                     # Calculate the new region based on new FOV
                     center_x, center_y = triggerbot.WIDTH // 2, triggerbot.HEIGHT // 2
@@ -1415,37 +698,26 @@ class MainWindow(QtWidgets.QMainWindow):
                     right = min(triggerbot.WIDTH, right)
                     bottom = min(triggerbot.HEIGHT, bottom)
                     
-                    # Update the check region - ensure all values are integers
-                    triggerbot.check_region = (int(left), int(top), int(right), int(bottom))
+                    # Update the check region - properly use the dictionary format expected by ScanningManager
+                    new_region = {
+                        'left': int(left),
+                        'top': int(top),
+                        'width': int(right - left),
+                        'height': int(bottom - top)
+                    }
+                    triggerbot.check_region = new_region
                     debug_log(f"New check region: {triggerbot.check_region}")
                     
-                    # Stop old camera if exists
-                    if triggerbot.camera:
-                        try:
-                            triggerbot.camera.stop()
-                        except:
-                            pass
+                    # Update the region in the scanning manager
+                    if hasattr(triggerbot, 'manager') and hasattr(triggerbot, 'region_name'):
+                        triggerbot.manager.update_region(triggerbot.region_name, region_dict=new_region)
+                        debug_log(f"Region updated in scanning manager for {triggerbot.region_name}")
                     
-                    # Force None and wait
-                    triggerbot.camera = None
-                    time.sleep(0.2)
-                    
-                    # Create new camera with updated region
-                    triggerbot.camera = bettercam.create(output_idx=0, region=triggerbot.check_region)
-                    
-                    # Ensure FPS is an integer before passing it to camera.start
-                    target_fps = int(triggerbot.fps)
-                    triggerbot.camera.start(target_fps=target_fps)
-                    debug_log(f"Camera recreated with new FOV - region: {triggerbot.check_region}, FPS: {target_fps}")
-                    
-                    # Reset the flag since we manually updated
-                    triggerbot.region_changed = False
-                    
-                    self.log(f"FOV updated from {old_fov} to {new_fov} - camera region immediately changed")
+                    self.log(f"FOV updated from {old_fov} to {new_fov} - check region immediately changed")
                 except Exception as e:
-                    debug_log(f"Error during forced camera update: {e}")
+                    debug_log(f"Error during forced check region update: {e}")
                     traceback.print_exc()
-                    self.log("Error updating camera - try restarting the TriggerBot")
+                    self.log("Error updating check region - try restarting the TriggerBot")
             
             self.log("Settings updated and applied to running TriggerBot")
         else:
@@ -1819,19 +1091,30 @@ class MainWindow(QtWidgets.QMainWindow):
             self.update_config()
             
             # Check if GPU acceleration was forced to off due to missing CUDA support
-            if not OPENCV_HAS_CUDA and self.config.get("use_gpu", False):
+            if not TORCH_AVAILABLE and self.config.get("use_gpu", False):
                 self.config["use_gpu"] = False
                 save_config(self.config)
-                self.log("GPU acceleration disabled - OpenCV not compiled with CUDA support")
+                self.log("GPU acceleration disabled - PyTorch not installed")
             
             # Use the average of min and max for backward compatibility
             avg_shooting_rate = (self.min_delay_spin.value() + self.max_delay_spin.value()) / 2
             
+            # Stop any existing thread first to ensure clean restart
+            if hasattr(self, 'trigger_bot_thread') and self.trigger_bot_thread:
+                try:
+                    self.trigger_bot_thread.stop()
+                    self.trigger_bot_thread.wait()
+                    self.trigger_bot_thread = None
+                    time.sleep(0.5)  # Small delay to ensure resources are released
+                except Exception as e:
+                    self.log(f"Error stopping previous thread: {str(e)}")
+            
             # Create and start trigger bot thread
             self.trigger_bot_thread = TriggerBotThread(
                 settings=self.config,
-                fov=self.fov_spin.value(),
-                shooting_rate=avg_shooting_rate,
+                fov=self.fov_slider.value(),
+                min_shooting_delay_ms=self.config.get("min_shooting_delay_ms", 50.0),
+                max_shooting_delay_ms=self.config.get("max_shooting_delay_ms", 80.0),
                 fps=self.config.get("fps", 200.0),
                 hsv_range=self.config.get("hsv_range", [[30,125,150],[30,255,255]])
             )
@@ -1840,18 +1123,55 @@ class MainWindow(QtWidgets.QMainWindow):
             self.log("TriggerBot ACTIVATED")
         else:
             # Stop the trigger bot thread
-            if self.trigger_bot_thread:
-                self.trigger_bot_thread.stop()
-                self.trigger_bot_thread.wait()
-                self.trigger_bot_thread = None
-            self.log("TriggerBot DEACTIVATED")
+            if hasattr(self, 'trigger_bot_thread') and self.trigger_bot_thread:
+                try:
+                    self.trigger_bot_thread.stop()
+                    if hasattr(self.trigger_bot_thread, 'wait'):
+                        self.trigger_bot_thread.wait(1000)
+                    print('[DEBUG] TriggerBot fully stopped and object deleted')
+                    self.trigger_bot_thread = None
+                except Exception as e:
+                    self.log(f"Error stopping triggerbot: {str(e)}")
+            # Check if both features are off
+            if (not self.trigger_bot_thread) and (not getattr(self, 'aim_lock_controller', None) or not self.aim_lock_enabled_checkbox.isChecked()):
+                print('[DEBUG] All scanning and status updates stopped (TriggerBot)')
 
     def closeEvent(self, event):
-        if self.trigger_bot_thread:
-            self.trigger_bot_thread.stop()
-            self.trigger_bot_thread.wait()
-        if self.worker:
-            shutdown_event.set()
+        # Stop TriggerBot thread/process
+        if hasattr(self, 'trigger_bot_thread') and self.trigger_bot_thread:
+            try:
+                self.trigger_bot_thread.stop()
+                if hasattr(self.trigger_bot_thread, 'wait'):
+                    self.trigger_bot_thread.wait(1000)
+                self.trigger_bot_thread = None
+            except Exception as e:
+                print(f"Error stopping TriggerBot: {e}")
+        # Stop AimLockController if running
+        if hasattr(self, 'aim_lock_controller') and self.aim_lock_controller:
+            try:
+                self.aim_lock_controller.stop()
+                self.aim_lock_controller = None
+            except Exception as e:
+                print(f"Error stopping AimLockController: {e}")
+        # Stop any worker threads
+        if hasattr(self, 'worker') and self.worker:
+            try:
+                shutdown_event.set()
+                self.worker.quit()
+                self.worker.wait(1000)
+                self.worker = None
+            except Exception as e:
+                print(f"Error stopping worker: {e}")
+        # Stop any custom threads (e.g., shortcut listener)
+        if hasattr(self, 'shortcut_thread') and self.shortcut_thread:
+            try:
+                self.shortcut_listener_active = False
+                if self.shortcut_thread.is_alive():
+                    self.shortcut_thread.join(timeout=1.0)
+                self.shortcut_thread = None
+            except Exception as e:
+                print(f"Error stopping shortcut thread: {e}")
+        print('[DEBUG] MainWindow closed, all scanning and status updates should be stopped')
         event.accept()
 
     def setup_instalock_tab(self):
@@ -1943,17 +1263,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def setup_triggerbot_tab(self):
         layout = QtWidgets.QVBoxLayout(self.triggerbot_tab)
-        
         # TriggerBot control group
         control_group = QtWidgets.QGroupBox("TriggerBot Control")
         control_layout = QtWidgets.QVBoxLayout(control_group)
-        
         # Enable checkbox and key binding
         top_row = QtWidgets.QHBoxLayout()
         self.triggerbot_checkbox = QtWidgets.QCheckBox("Enable TriggerBot")
-        self.triggerbot_checkbox.setChecked(True)  # Changed to True to enable by default
+        self.triggerbot_checkbox.setChecked(True)
         self.triggerbot_checkbox.stateChanged.connect(self.toggle_triggerbot)
-        
         key_layout = QtWidgets.QHBoxLayout()
         key_label = QtWidgets.QLabel("Activation Key:")
         self.trigger_key_combo = QtWidgets.QComboBox()
@@ -1962,258 +1279,148 @@ class MainWindow(QtWidgets.QMainWindow):
         initial_key = inv_key_map.get(self.config.get("keybind", 164), "Alt")
         self.trigger_key_combo.setCurrentText(initial_key)
         self.trigger_key_combo.currentIndexChanged.connect(self.update_keybind)
-        
         key_layout.addWidget(key_label)
         key_layout.addWidget(self.trigger_key_combo)
-        
         top_row.addWidget(self.triggerbot_checkbox)
         top_row.addLayout(key_layout)
         control_layout.addLayout(top_row)
-        
         # Mode selection
         mode_layout = QtWidgets.QHBoxLayout()
         mode_label = QtWidgets.QLabel("Trigger Mode:")
         self.hold_radio = QtWidgets.QRadioButton("Hold")
         self.toggle_radio = QtWidgets.QRadioButton("Toggle")
-        
         if self.config.get("trigger_mode", "hold") == "toggle":
             self.toggle_radio.setChecked(True)
         else:
             self.hold_radio.setChecked(True)
-            
         self.hold_radio.toggled.connect(self.update_trigger_mode)
         self.toggle_radio.toggled.connect(self.update_trigger_mode)
-        
         mode_layout.addWidget(mode_label)
         mode_layout.addWidget(self.hold_radio)
         mode_layout.addWidget(self.toggle_radio)
         mode_layout.addStretch()
-        
         control_layout.addLayout(mode_layout)
         layout.addWidget(control_group)
-        
-        # GPU acceleration
-        acceleration_group = QtWidgets.QGroupBox("GPU Acceleration")
-        acceleration_layout = QtWidgets.QVBoxLayout(acceleration_group)
-        
-        # Create GPU status grid layout
-        gpu_status_layout = QtWidgets.QGridLayout()
-        
-        # PyTorch status
-        torch_label = QtWidgets.QLabel("PyTorch GPU:")
-        torch_status = QtWidgets.QLabel()
-        
-        if TORCH_AVAILABLE and torch.cuda.is_available():
-            torch_status.setText(f"✅ Available - {torch.cuda.get_device_name(0)}")
-            torch_status.setStyleSheet("color: #32CD32; font-weight: bold;")
-        elif TORCH_AVAILABLE:
-            torch_status.setText("⚠️ Installed but CUDA unavailable")
-            torch_status.setStyleSheet("color: #FFA500; font-weight: bold;")
-        else:
-            torch_status.setText("❌ Not installed")
-            torch_status.setStyleSheet("color: #FF6347; font-weight: bold;")
-        
-        gpu_status_layout.addWidget(torch_label, 0, 0)
-        gpu_status_layout.addWidget(torch_status, 0, 1)
-        
-        # OpenCV status
-        opencv_label = QtWidgets.QLabel("OpenCV GPU:")
-        opencv_status = QtWidgets.QLabel()
-        
-        if OPENCV_HAS_CUDA and CUDA_AVAILABLE:
-            opencv_status.setText(f"✅ Available")
-            opencv_status.setStyleSheet("color: #32CD32; font-weight: bold;")
-        elif OPENCV_HAS_CUDA:
-            opencv_status.setText("⚠️ Compiled with CUDA but no devices found")
-            opencv_status.setStyleSheet("color: #FFA500; font-weight: bold;")
-        else:
-            opencv_status.setText("❌ Not compiled with CUDA")
-            opencv_status.setStyleSheet("color: #FF6347; font-weight: bold;")
-        
-        gpu_status_layout.addWidget(opencv_label, 1, 0)
-        gpu_status_layout.addWidget(opencv_status, 1, 1)
-        
-        # Add to layout
-        acceleration_layout.addLayout(gpu_status_layout)
-        
-        # Recommended acceleration method
-        recommended_method = "CPU (no GPU acceleration available)"
-        if TORCH_AVAILABLE and torch.cuda.is_available():
-            recommended_method = "PyTorch GPU"
-        elif OPENCV_HAS_CUDA and CUDA_AVAILABLE:
-            recommended_method = "OpenCV GPU"
-        
-        recommend_label = QtWidgets.QLabel(f"Recommended method: {recommended_method}")
-        recommend_label.setStyleSheet("font-weight: bold; margin-top: 5px;")
-        acceleration_layout.addWidget(recommend_label)
-        
-        # Add horizontal line separator
-        line = QtWidgets.QFrame()
-        line.setFrameShape(QtWidgets.QFrame.HLine)
-        line.setFrameShadow(QtWidgets.QFrame.Sunken)
-        acceleration_layout.addWidget(line)
-        
-        # GPU usage toggle
-        gpu_enabled = TORCH_AVAILABLE and torch.cuda.is_available() or (OPENCV_HAS_CUDA and CUDA_AVAILABLE)
-        self.use_gpu_checkbox = QtWidgets.QCheckBox("Use GPU Acceleration")
-        self.use_gpu_checkbox.setChecked(self.config.get("use_gpu", True) and gpu_enabled)
-        self.use_gpu_checkbox.setToolTip("Enable GPU acceleration for faster color detection")
-        
-        if not gpu_enabled:
-            self.use_gpu_checkbox.setChecked(False)
-            self.use_gpu_checkbox.setEnabled(False)
-            self.use_gpu_checkbox.setToolTip("GPU acceleration not available - CPU mode only")
-            
-        self.use_gpu_checkbox.stateChanged.connect(self.update_gpu_config)
-        acceleration_layout.addWidget(self.use_gpu_checkbox)
-        
-        # Auto fallback toggle
-        self.auto_fallback_checkbox = QtWidgets.QCheckBox("Auto Fallback to CPU if GPU Fails")
-        self.auto_fallback_checkbox.setChecked(self.config.get("auto_fallback_to_cpu", True))
-        self.auto_fallback_checkbox.setToolTip("Automatically switch to CPU mode if GPU detection fails multiple times")
-        self.auto_fallback_checkbox.stateChanged.connect(self.update_fallback_config)
-        acceleration_layout.addWidget(self.auto_fallback_checkbox)
-        
-        # Smart acceleration checkbox
-        self.smart_accel_checkbox = QtWidgets.QCheckBox("Smart Acceleration (Auto-select best method)")
-        self.smart_accel_checkbox.setChecked(self.config.get("smart_acceleration", True))
-        self.smart_accel_checkbox.setToolTip("Automatically benchmark and select the fastest method")
-        self.smart_accel_checkbox.stateChanged.connect(self.update_smart_acceleration)
-        acceleration_layout.addWidget(self.smart_accel_checkbox)
-        
-        # Add test mode checkbox for debugging
-        self.test_mode_checkbox = QtWidgets.QCheckBox("Enable Test Mode (Alternate GPU/CPU)")
-        self.test_mode_checkbox.setChecked(self.config.get("test_mode", False))
-        self.test_mode_checkbox.setToolTip("Alternate between GPU and CPU processing every few frames to compare performance")
-        self.test_mode_checkbox.stateChanged.connect(self.update_test_mode)
-        acceleration_layout.addWidget(self.test_mode_checkbox)
-        
-        # Buttons Row
-        button_row = QtWidgets.QHBoxLayout()
-        
-        # Run benchmark button
-        benchmark_button = QtWidgets.QPushButton("Run Performance Benchmark")
-        benchmark_button.setToolTip("Run a benchmark to compare CPU vs GPU performance")
-        benchmark_button.clicked.connect(self.run_benchmark)
-        button_row.addWidget(benchmark_button)
-        
-        # Debug report button
-        debug_button = QtWidgets.QPushButton("Generate Debug Report")
-        debug_button.clicked.connect(self.generate_debug_report)
-        debug_button.setToolTip("Create a report with system and CUDA information to help troubleshoot")
-        button_row.addWidget(debug_button)
-        
-        acceleration_layout.addLayout(button_row)
-        
-        layout.addWidget(acceleration_group)
-        
-        # Add spacer
-        layout.addStretch()
-    
-    def setup_settings_tab(self):
-        layout = QtWidgets.QVBoxLayout(self.settings_tab)
-        
-        # Performance settings
-        perf_group = QtWidgets.QGroupBox("Performance Settings")
-        perf_layout = QtWidgets.QFormLayout(perf_group)
-        
-        # FOV setting
-        self.fov_spin = QtWidgets.QDoubleSpinBox()
-        self.fov_spin.setRange(1.0, 50.0)
-        self.fov_spin.setValue(self.config.get("fov", 5.0))
-        self.fov_spin.setSingleStep(0.5)
-        self.fov_spin.setDecimals(1)
-        self.fov_spin.valueChanged.connect(self.update_config)
-        perf_layout.addRow("Detection FOV:", self.fov_spin)
-        
-        # Delay setting - replaced with Min/Max Delay
-        delay_layout = QtWidgets.QHBoxLayout()
-        
-        # Min delay setting
+        # --- TriggerBot Settings Group ---
+        triggerbot_settings_group = QtWidgets.QGroupBox("TriggerBot Settings")
+        triggerbot_settings_layout = QtWidgets.QFormLayout(triggerbot_settings_group)
+        # FOV as slider with label, only update config on sliderReleased
+        self.fov_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.fov_slider.setRange(1, 50)
+        self.fov_slider.setValue(int(self.config.get("fov", 5.0)))
+        self.fov_slider.setTickInterval(1)
+        self.fov_slider.setSingleStep(1)
+        self.fov_slider.setToolTip("Field of View: Controls the detection area size.")
+        self.fov_slider.sliderReleased.connect(self.update_fov_from_slider)
+        self.fov_slider.valueChanged.connect(self.update_fov_label)
+        self.fov_value_label = QtWidgets.QLabel(str(self.fov_slider.value()))
+        fov_layout = QtWidgets.QHBoxLayout()
+        fov_layout.addWidget(self.fov_slider)
+        fov_layout.addWidget(self.fov_value_label)
+        fov_widget = QtWidgets.QWidget()
+        fov_widget.setLayout(fov_layout)
+        triggerbot_settings_layout.addRow("Detection FOV:", fov_widget)
+        # Shooting delay (min/max)
         self.min_delay_spin = QtWidgets.QDoubleSpinBox()
         self.min_delay_spin.setRange(10.0, 500.0)
-        self.min_delay_spin.setValue(self.config.get("min_shooting_rate", 50.0))
+        self.min_delay_spin.setValue(self.config.get("min_shooting_delay_ms", 50.0))
         self.min_delay_spin.setSingleStep(5.0)
         self.min_delay_spin.setDecimals(0)
-        min_delay_label = QtWidgets.QLabel("Min:")
-        
-        # Max delay setting
+        self.min_delay_spin.valueChanged.connect(self.update_config)
         self.max_delay_spin = QtWidgets.QDoubleSpinBox()
         self.max_delay_spin.setRange(10.0, 500.0)
-        self.max_delay_spin.setValue(self.config.get("max_shooting_rate", 80.0))
+        self.max_delay_spin.setValue(self.config.get("max_shooting_delay_ms", 80.0))
         self.max_delay_spin.setSingleStep(5.0)
         self.max_delay_spin.setDecimals(0)
-        max_delay_label = QtWidgets.QLabel("Max:")
-        
-        # Connect value changed signals
-        self.min_delay_spin.valueChanged.connect(self.update_config)
         self.max_delay_spin.valueChanged.connect(self.update_config)
-        
-        # Add to layout
-        delay_layout.addWidget(min_delay_label)
+        delay_layout = QtWidgets.QHBoxLayout()
+        delay_layout.addWidget(QtWidgets.QLabel("Min:"))
         delay_layout.addWidget(self.min_delay_spin)
-        delay_layout.addWidget(max_delay_label)
+        delay_layout.addWidget(QtWidgets.QLabel("Max:"))
         delay_layout.addWidget(self.max_delay_spin)
-        
         delay_container = QtWidgets.QWidget()
         delay_container.setLayout(delay_layout)
-        perf_layout.addRow("Shooting Delay (ms):", delay_container)
-        
-        # FPS setting
+        triggerbot_settings_layout.addRow("Shooting Delay (ms):", delay_container)
+        # Press duration
+        self.press_duration_toggle = QtWidgets.QCheckBox("Enable Random Press Duration")
+        self.press_duration_toggle.setChecked(self.config.get("enable_random_press_duration", True))
+        self.press_duration_toggle.stateChanged.connect(self.on_press_duration_toggle)
+        triggerbot_settings_layout.addRow(self.press_duration_toggle)
+        self.press_duration_min_spin = QtWidgets.QDoubleSpinBox()
+        self.press_duration_min_spin.setRange(0.01, 1.00)
+        self.press_duration_min_spin.setValue(self.config.get("press_duration_min_s", 0.01))
+        self.press_duration_min_spin.setSingleStep(0.01)
+        self.press_duration_min_spin.setDecimals(2)
+        self.press_duration_min_spin.valueChanged.connect(self.update_press_duration_min)
+        self.press_duration_max_spin = QtWidgets.QDoubleSpinBox()
+        self.press_duration_max_spin.setRange(0.01, 1.00)
+        self.press_duration_max_spin.setValue(self.config.get("press_duration_max_s", 0.05))
+        self.press_duration_max_spin.setSingleStep(0.01)
+        self.press_duration_max_spin.setDecimals(2)
+        self.press_duration_max_spin.valueChanged.connect(self.update_press_duration_max)
+        press_duration_layout = QtWidgets.QFormLayout()
+        press_duration_layout.addRow("Min Duration (s):", self.press_duration_min_spin)
+        press_duration_layout.addRow("Max Duration (s):", self.press_duration_max_spin)
+        triggerbot_settings_layout.addRow(press_duration_layout)
+        # Click behavior
+        self.block_movements_checkbox = QtWidgets.QCheckBox("Block Movement Keys While Shooting")
+        self.block_movements_checkbox.setChecked(self.config.get("block_movements", False))
+        self.block_movements_checkbox.stateChanged.connect(self.update_block_movements)
+        self.block_movements_checkbox.setToolTip("When enabled, W/A/S/D keys will be temporarily released while shooting")
+        triggerbot_settings_layout.addRow(self.block_movements_checkbox)
+        layout.addWidget(triggerbot_settings_group)
+        layout.addStretch()
+
+    def update_fov_label(self, value):
+        self.fov_value_label.setText(str(value))
+
+    def update_fov_from_slider(self):
+        self.update_config()
+
+    def setup_settings_tab(self):
+        layout = QtWidgets.QVBoxLayout(self.settings_tab)
+        # --- Only keep FPS and Debug Mode ---
+        perf_group = QtWidgets.QGroupBox("Performance Settings")
+        perf_layout = QtWidgets.QFormLayout(perf_group)
+        # FPS setting (shared)
         self.fps_spin = QtWidgets.QDoubleSpinBox()
         self.fps_spin.setRange(30.0, 1000.0)
         self.fps_spin.setValue(self.config.get("fps", 200.0))
         self.fps_spin.setSingleStep(10.0)
         self.fps_spin.setDecimals(0)
         self.fps_spin.valueChanged.connect(self.update_config)
-        perf_layout.addRow("Target FPS:", self.fps_spin)
-        
+        fps_label = QtWidgets.QLabel("Target FPS:")
+        fps_note = QtWidgets.QLabel("This controls how often the TriggerBot and Aim Lock scan for targets. Higher FPS = faster response, but more CPU/GPU usage.")
+        fps_note.setStyleSheet("font-size: 11px; color: #888;")
+        perf_layout.addRow(fps_label, self.fps_spin)
+        perf_layout.addRow(fps_note)
+        # --- CPU/GPU radio toggle ---
+        self.cpu_radio = QtWidgets.QRadioButton("CPU")
+        self.gpu_radio = QtWidgets.QRadioButton("GPU")
+        use_gpu = self.config.get("use_gpu", False)
+        if use_gpu:
+            self.gpu_radio.setChecked(True)
+        else:
+            self.cpu_radio.setChecked(True)
+        self.cpu_radio.toggled.connect(self.update_performance_mode)
+        self.gpu_radio.toggled.connect(self.update_performance_mode)
+        radio_layout = QtWidgets.QHBoxLayout()
+        radio_layout.addWidget(QtWidgets.QLabel("Processing Mode:"))
+        radio_layout.addWidget(self.cpu_radio)
+        radio_layout.addWidget(self.gpu_radio)
+        radio_layout.addStretch()
+        perf_layout.addRow(radio_layout)
         layout.addWidget(perf_group)
-        
-        # Click behavior
-        click_group = QtWidgets.QGroupBox("Click Behavior")
-        click_layout = QtWidgets.QVBoxLayout(click_group)
-        
-        # Random press duration
-        duration_layout = QtWidgets.QHBoxLayout()
-        self.press_duration_toggle = QtWidgets.QCheckBox("Enable Random Press Duration")
-        self.press_duration_toggle.setChecked(self.config.get("enable_press_duration", True))
-        self.press_duration_toggle.stateChanged.connect(self.on_press_duration_toggle)
-        duration_layout.addWidget(self.press_duration_toggle)
-        click_layout.addLayout(duration_layout)
-        
-        # Press duration settings
-        press_duration_layout = QtWidgets.QFormLayout()
-        self.press_duration_min_spin = QtWidgets.QDoubleSpinBox()
-        self.press_duration_min_spin.setRange(0.01, 1.00)
-        self.press_duration_min_spin.setValue(self.config.get("press_duration_min", 0.01))
-        self.press_duration_min_spin.setSingleStep(0.01)
-        self.press_duration_min_spin.setDecimals(2)
-        self.press_duration_min_spin.valueChanged.connect(self.update_press_duration_min)
-        press_duration_layout.addRow("Min Duration (s):", self.press_duration_min_spin)
-        
-        self.press_duration_max_spin = QtWidgets.QDoubleSpinBox()
-        self.press_duration_max_spin.setRange(0.01, 1.00)
-        self.press_duration_max_spin.setValue(self.config.get("press_duration_max", 0.05))
-        self.press_duration_max_spin.setSingleStep(0.01)
-        self.press_duration_max_spin.setDecimals(2)
-        self.press_duration_max_spin.valueChanged.connect(self.update_press_duration_max)
-        press_duration_layout.addRow("Max Duration (s):", self.press_duration_max_spin)
-        
-        click_layout.addLayout(press_duration_layout)
-        
-        # Block movement option
-        self.block_movements_checkbox = QtWidgets.QCheckBox("Block Movement Keys While Shooting")
-        self.block_movements_checkbox.setChecked(self.config.get("block_movements", False))
-        self.block_movements_checkbox.stateChanged.connect(self.update_block_movements)
-        self.block_movements_checkbox.setToolTip("When enabled, W/A/S/D keys will be temporarily released while shooting")
-        click_layout.addWidget(self.block_movements_checkbox)
-        
-        layout.addWidget(click_group)
-        
-        # Add spacer
+        # Debug Mode
+        debug_group = QtWidgets.QGroupBox("Debug Settings")
+        debug_layout = QtWidgets.QVBoxLayout(debug_group)
+        self.aim_lock_debug_mode_checkbox = QtWidgets.QCheckBox("Enable Debug Mode (Aim Lock)")
+        self.aim_lock_debug_mode_checkbox.setChecked(self.config.get("aim_lock_debug_mode", False))
+        self.aim_lock_debug_mode_checkbox.stateChanged.connect(self.update_aim_lock_config)
+        debug_layout.addWidget(self.aim_lock_debug_mode_checkbox)
+        layout.addWidget(debug_group)
         layout.addStretch()
-    
+
     def setup_logs_tab(self):
         layout = QtWidgets.QVBoxLayout(self.logs_tab)
         
@@ -2231,6 +1438,113 @@ class MainWindow(QtWidgets.QMainWindow):
         
         layout.addLayout(controls_layout)
         layout.addWidget(self.log_text)
+
+    def setup_aimlock_tab(self):
+        layout = QtWidgets.QVBoxLayout(self.aimlock_tab)
+        aimlock_group = QtWidgets.QGroupBox("Aim Lock Settings")
+        aimlock_layout = QtWidgets.QFormLayout(aimlock_group)
+        # Master toggle
+        self.aim_lock_enabled_checkbox = QtWidgets.QCheckBox("Enable Aim Lock")
+        self.aim_lock_enabled_checkbox.setChecked(self.config.get("aim_lock_enabled", False))
+        self.aim_lock_enabled_checkbox.stateChanged.connect(self.toggle_aim_lock)
+        aimlock_layout.addRow(self.aim_lock_enabled_checkbox)
+        # Config controls
+        self.aim_lock_radius_x_spin = QtWidgets.QSpinBox()
+        self.aim_lock_radius_x_spin.setRange(1, 100)
+        self.aim_lock_radius_x_spin.setValue(self.config.get("aim_lock_scan_area_x", 16))
+        self.aim_lock_radius_x_spin.valueChanged.connect(self.update_aim_lock_config)
+        aimlock_layout.addRow("Scan Area X (px):", self.aim_lock_radius_x_spin)
+        self.aim_lock_radius_y_spin = QtWidgets.QSpinBox()
+        self.aim_lock_radius_y_spin.setRange(1, 100)
+        self.aim_lock_radius_y_spin.setValue(self.config.get("aim_lock_scan_area_y", 10))
+        self.aim_lock_radius_y_spin.valueChanged.connect(self.update_aim_lock_config)
+        aimlock_layout.addRow("Scan Area Y (px):", self.aim_lock_radius_y_spin)
+        # Aim Lock Strength as slider
+        self.aim_lock_strength_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.aim_lock_strength_slider.setRange(1, 500)
+        self.aim_lock_strength_slider.setValue(self.config.get("aim_lock_strength", 68))
+        self.aim_lock_strength_slider.setTickInterval(5)
+        self.aim_lock_strength_slider.setSingleStep(1)
+        self.aim_lock_strength_slider.setToolTip("Controls how much the aim slows down when a target is detected. Higher = stronger lock.")
+        self.aim_lock_strength_slider.sliderReleased.connect(self.update_aim_lock_config)
+        self.aim_lock_strength_slider.valueChanged.connect(self.update_aim_lock_strength_label)
+        self.aim_lock_strength_value_label = QtWidgets.QLabel(str(self.aim_lock_strength_slider.value()))
+        strength_layout = QtWidgets.QHBoxLayout()
+        strength_layout.addWidget(self.aim_lock_strength_slider)
+        strength_layout.addWidget(self.aim_lock_strength_value_label)
+        strength_widget = QtWidgets.QWidget()
+        strength_widget.setLayout(strength_layout)
+        aimlock_layout.addRow("Aim Lock Strength (ms):", strength_widget)
+        # --- Customizable toggle key and mode ---
+        # Key selection
+        key_layout = QtWidgets.QHBoxLayout()
+        key_label = QtWidgets.QLabel("Activation Key:")
+        self.aim_lock_key_combo = QtWidgets.QComboBox()
+        self.aim_lock_key_combo.addItems(list(self.key_map.keys()))
+        # Use the string key if present, else fallback to keybind
+        key_str = self.config.get('aim_lock_toggle_key', None)
+        if key_str is None:
+            inv_key_map = {v: k for k, v in self.key_map.items()}
+            key_str = inv_key_map.get(self.config.get('aim_lock_keybind', 164), "Alt")
+        self.aim_lock_key_combo.setCurrentText(key_str)
+        self.aim_lock_key_combo.currentIndexChanged.connect(self.update_aim_lock_config)
+        key_layout.addWidget(key_label)
+        key_layout.addWidget(self.aim_lock_key_combo)
+        # Mode selection
+        mode_layout = QtWidgets.QHBoxLayout()
+        mode_label = QtWidgets.QLabel("Activation Mode:")
+        self.aim_lock_hold_radio = QtWidgets.QRadioButton("Hold")
+        self.aim_lock_toggle_radio = QtWidgets.QRadioButton("Toggle")
+        if self.config.get("aim_lock_mode", "hold") == "toggle":
+            self.aim_lock_toggle_radio.setChecked(True)
+        else:
+            self.aim_lock_hold_radio.setChecked(True)
+        self.aim_lock_hold_radio.toggled.connect(self.update_aim_lock_config)
+        self.aim_lock_toggle_radio.toggled.connect(self.update_aim_lock_config)
+        mode_layout.addWidget(mode_label)
+        mode_layout.addWidget(self.aim_lock_hold_radio)
+        mode_layout.addWidget(self.aim_lock_toggle_radio)
+        mode_layout.addStretch()
+        # Add to form
+        aimlock_layout.addRow(key_layout)
+        aimlock_layout.addRow(mode_layout)
+        layout.addWidget(aimlock_group)
+        layout.addStretch()
+
+    def update_aim_lock_strength_label(self, value):
+        self.aim_lock_strength_value_label.setText(str(value))
+
+    def update_aim_lock_config(self):
+        self.config["aim_lock_scan_area_x"] = self.aim_lock_radius_x_spin.value()
+        self.config["aim_lock_scan_area_y"] = self.aim_lock_radius_y_spin.value()
+        self.config["aim_lock_strength"] = self.aim_lock_strength_slider.value()
+        # Keybind
+        key_text = self.aim_lock_key_combo.currentText()
+        # Save both the original key name and lowercase version
+        self.config["aim_lock_toggle_key"] = key_text.lower() # Always lowercase for keyboard detection
+        self.config["aim_lock_keybind"] = self.key_map.get(key_text, 164)
+        # Mode
+        self.config["aim_lock_mode"] = "toggle" if self.aim_lock_toggle_radio.isChecked() else "hold"
+        save_config(self.config)
+        print('[DEBUG] Saved aim_lock_toggle_key:', self.config.get('aim_lock_toggle_key'))
+        print('[DEBUG] Saved aim_lock_keybind:', self.config.get('aim_lock_keybind'))
+        print('[DEBUG] UI combo currentText:', key_text)
+        # --- FIX: Do NOT reload config from disk here ---
+        # Restart AimLockController with a new instance if enabled
+        if self.aim_lock_enabled_checkbox.isChecked():
+            if self.aim_lock_controller:
+                self.aim_lock_controller.stop()
+                del self.aim_lock_controller
+            self.aim_lock_controller = AimLockController(self.config)
+            self.aim_lock_controller.start()
+        else:
+            if self.aim_lock_controller:
+                self.aim_lock_controller.update_config(self.config)
+
+    def update_aim_lock_status_ui(self):
+        status = self.aim_lock_controller.get_status()
+        text = f"Status: {'Active' if status['active'] else 'Idle'} | Target: {'Detected' if status['target_found'] else 'Not Found'} | Response: {status['average_response_time']}ms | FPS: {status['fps']}"
+        self.aim_lock_status_label.setText(text)
 
     def update_test_mode(self):
         """Update test mode setting for alternating between CPU and GPU"""
@@ -2269,20 +1583,6 @@ class MainWindow(QtWidgets.QMainWindow):
             # Python info
             report.append(f"Python: {sys.version}")
             
-            # OpenCV info
-            report.append("\n=== OpenCV Information ===")
-            report.append(f"OpenCV Version: {cv2.__version__}")
-            report.append(f"OpenCV CUDA Support Compiled: {OPENCV_HAS_CUDA}")
-            # Get more detailed OpenCV build information
-            try:
-                cv_info = cv2.getBuildInformation()
-                # Extract CUDA-related info from build information
-                cuda_lines = [line for line in cv_info.split('\n') if 'CUDA' in line]
-                for line in cuda_lines[:10]:  # Limit to avoid too much output
-                    report.append(f"  {line.strip()}")
-            except Exception as e:
-                report.append(f"  Error getting OpenCV build info: {str(e)}")
-            
             # PyTorch info
             report.append("\n=== PyTorch CUDA Support ===")
             if TORCH_AVAILABLE:
@@ -2310,7 +1610,7 @@ class MainWindow(QtWidgets.QMainWindow):
             
             # CUDA info
             report.append("\n=== CUDA System Info ===")
-            report.append(f"CUDA Available for Use: {CUDA_AVAILABLE}")
+            report.append(f"CUDA Available for Use: {TORCH_AVAILABLE}")
             cuda_device_count = 0
             try:
                 cuda_device_count = cv2.cuda.getCudaEnabledDeviceCount()
@@ -2432,7 +1732,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # Check if we have PyTorch with CUDA working
             if TORCH_AVAILABLE and torch.cuda.is_available() and torch.cuda.device_count() > 0:
                 recommendations.append("✅ PyTorch with CUDA is properly configured!")
-                if not OPENCV_HAS_CUDA:
+                if not TORCH_AVAILABLE:
                     recommendations.append("Consider implementing PyTorch-based color detection as fallback")
                     recommendations.append("PyTorch provides a reliable GPU acceleration alternative to OpenCV")
             elif TORCH_AVAILABLE and not torch.cuda.is_available():
@@ -2444,7 +1744,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 recommendations.append("pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121")
             
             # Check if OpenCV has CUDA support
-            if OPENCV_HAS_CUDA:
+            if TORCH_AVAILABLE:
                 if cv2.cuda.getCudaEnabledDeviceCount() > 0:
                     recommendations.append("✅ OpenCV with CUDA is properly configured!")
                 else:
@@ -2508,8 +1808,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     if benchmark_results['pytorch_gpu_time'] < float('inf'):
                         self.log(f"PyTorch GPU time: {benchmark_results['pytorch_gpu_time']:.2f}ms")
                         
-                    if benchmark_results['opencv_gpu_time'] < float('inf'):
-                        self.log(f"OpenCV GPU time: {benchmark_results['opencv_gpu_time']:.2f}ms")
+                    if benchmark_results['cpu_time'] < float('inf'):
+                        self.log(f"OpenCV CPU time: {benchmark_results['cpu_time']:.2f}ms")
                     
                     self.log(f"Best method: {benchmark_results['best_method']}")
                     
@@ -2559,8 +1859,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if benchmark_results['pytorch_gpu_time'] < float('inf'):
                 self.log(f"PyTorch GPU time: {benchmark_results['pytorch_gpu_time']:.2f}ms")
                 
-            if benchmark_results['opencv_gpu_time'] < float('inf'):
-                self.log(f"OpenCV GPU time: {benchmark_results['opencv_gpu_time']:.2f}ms")
+            if benchmark_results['cpu_time'] < float('inf'):
+                self.log(f"OpenCV CPU time: {benchmark_results['cpu_time']:.2f}ms")
             
             self.log(f"Best method: {benchmark_results['best_method']}")
             
@@ -2612,7 +1912,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def update_press_duration_min(self, value):
         """Update minimum press duration and apply immediately to running triggerbot"""
-        self.config["press_duration_min"] = value
+        self.config["press_duration_min_s"] = value
         save_config(self.config)
         
         # Update active triggerbot if running
@@ -2622,7 +1922,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def update_press_duration_max(self, value):
         """Update maximum press duration and apply immediately to running triggerbot"""
-        self.config["press_duration_max"] = value
+        self.config["press_duration_max_s"] = value
         save_config(self.config)
         
         # Update active triggerbot if running
@@ -2630,89 +1930,993 @@ class MainWindow(QtWidgets.QMainWindow):
             self.trigger_bot_thread.update_config(self.config)
             self.log(f"Press duration maximum set to {value:.2f}s - applied immediately")
 
-def fast_benchmark(frame, iterations=10):
-    """Run a quick benchmark to compare CPU vs GPU performance for real-time use"""
-    try:
-        # Make a copy of the frame to avoid modifying the original
-        if frame is None:
-            return {"best_method": "CPU", "ratio": 0}
+    def toggle_aim_lock(self, state):
+        if state == QtCore.Qt.Checked:
+            if not self.aim_lock_controller:
+                self.aim_lock_controller = AimLockController(self.config)
+            self.aim_lock_controller.update_config(self.config)
+            self.aim_lock_controller.start()
+        else:
+            if self.aim_lock_controller:
+                self.aim_lock_controller.stop()
+                print('[DEBUG] AimLockController fully stopped')
+            # Check if both features are off
+            if (not getattr(self, 'trigger_bot_thread', None) or not self.triggerbot_checkbox.isChecked()) and (not self.aim_lock_controller or not self.aim_lock_enabled_checkbox.isChecked()):
+                print('[DEBUG] All scanning and status updates stopped (AimLock)')
+
+    def update_performance_mode(self):
+        self.config["use_gpu"] = self.gpu_radio.isChecked()
+        save_config(self.config)
+        # Update active triggerbot and aimlock if running
+        if hasattr(self, 'trigger_bot_thread') and self.trigger_bot_thread and self.trigger_bot_thread.isRunning():
+            self.trigger_bot_thread.update_config(self.config)
+        if hasattr(self, 'aim_lock_controller') and self.aim_lock_controller:
+            self.aim_lock_controller.update_config(self.config)
+
+    def setup_profiling_tab(self):
+        """Setup the Profiling tab UI"""
+        layout = QtWidgets.QVBoxLayout(self.profiling_tab)
+
+        # --- Profiling Tab Title ---
+        title = QtWidgets.QLabel("<h2>Profile Management</h2>")
+        title.setAlignment(QtCore.Qt.AlignCenter)
+        title.setAccessibleName("Profile Management Title")
+        title.setAccessibleDescription("Section title for profile management features.")
+        layout.addWidget(title)
+
+        # --- Active Profile Label ---
+        self.active_profile_label = QtWidgets.QLabel("Active Profile: None")
+        self.active_profile_label.setStyleSheet("font-weight: bold; color: #32CD32; font-size: 15px;")
+        layout.addWidget(self.active_profile_label)
+
+        # --- Shortcut Status Label ---
+        self.shortcut_status_label = QtWidgets.QLabel("")
+        self.shortcut_status_label.setStyleSheet("color: #FFA500;")
+        layout.addWidget(self.shortcut_status_label)
+
+        # --- Auto Mode Status Label ---
+        self.auto_status_label = QtWidgets.QLabel("")
+        self.auto_status_label.setStyleSheet("color: #FFA500;")
+        layout.addWidget(self.auto_status_label)
+
+        # --- Profile Selection Dropdown ---
+        profile_select_layout = QtWidgets.QHBoxLayout()
+        profile_label = QtWidgets.QLabel("Select Profile:")
+        profile_label.setToolTip("Choose a profile to view or edit.")
+        self.profile_combo = QtWidgets.QComboBox()
+        self.refresh_profiles()
+        self.profile_combo.currentIndexChanged.connect(self.on_profile_selected)
+        profile_select_layout.addWidget(profile_label)
+        profile_select_layout.addWidget(self.profile_combo)
+        layout.addLayout(profile_select_layout)
+
+        # --- Auto Mode Toggle ---
+        auto_layout = QtWidgets.QHBoxLayout()
+        self.auto_checkbox = QtWidgets.QCheckBox("Enable Auto Profile Detection (1/2)")
+        self.auto_checkbox.setToolTip("When enabled, pressing 1 or 2 will scan for gun name and auto-load profile.")
+        self.auto_checkbox.stateChanged.connect(self.on_auto_mode_toggled)
+        auto_layout.addWidget(self.auto_checkbox)
+        auto_layout.addStretch()
+        layout.addLayout(auto_layout)
+
+        # --- Profile Editor Panel (UI controls, not JSON) ---
+        self.profile_editor_group = QtWidgets.QGroupBox("Profile Editor")
+        self.profile_editor_group.setToolTip("Edit all settings for the selected profile below.")
+        # Use a scroll area for the editor controls
+        scroll_area = QtWidgets.QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setMinimumHeight(400)
+        editor_widget = QtWidgets.QWidget()
+        self.profile_editor_layout = QtWidgets.QGridLayout(editor_widget)
+        scroll_area.setWidget(editor_widget)
+        self.profile_editor_group.setLayout(QtWidgets.QVBoxLayout())
+        self.profile_editor_group.layout().addWidget(scroll_area)
+        layout.addWidget(self.profile_editor_group)
+        self.profile_editor_controls = {}
+        self.build_profile_editor_controls_grid()
+
+        # --- Save/Reset/Import/Export/Reset-to-Default Buttons ---
+        btn_layout = QtWidgets.QHBoxLayout()
+        self.save_profile_btn = QtWidgets.QPushButton("💾 Save Profile")
+        self.save_profile_btn.setStyleSheet("font-weight: bold; background-color: #32CD32; color: black;")
+        self.save_profile_btn.setToolTip("Save changes to this profile.")
+        self.save_profile_btn.clicked.connect(self.save_current_profile)
+        self.reset_profile_btn = QtWidgets.QPushButton("↩️ Reset Editor")
+        self.reset_profile_btn.setStyleSheet("font-weight: bold; background-color: #FFA500; color: black;")
+        self.reset_profile_btn.setToolTip("Reset all fields to the last saved state for this profile.")
+        self.reset_profile_btn.clicked.connect(self.reset_profile_editor)
+        self.import_profile_btn = QtWidgets.QPushButton("⬆️ Import Profile")
+        self.import_profile_btn.setStyleSheet("font-weight: bold; background-color: #2196F3; color: white;")
+        self.import_profile_btn.setToolTip("Import a profile from a JSON file.")
+        self.import_profile_btn.clicked.connect(self.import_profile)
+        self.export_profile_btn = QtWidgets.QPushButton("⬇️ Export Profile")
+        self.export_profile_btn.setStyleSheet("font-weight: bold; background-color: #607D8B; color: white;")
+        self.export_profile_btn.setToolTip("Export the current profile to a JSON file.")
+        self.export_profile_btn.clicked.connect(self.export_profile)
+        self.reset_default_btn = QtWidgets.QPushButton("🧹 Reset to Default")
+        self.reset_default_btn.setStyleSheet("font-weight: bold; background-color: #E91E63; color: white;")
+        self.reset_default_btn.setToolTip("Reset this profile to default values.")
+        self.reset_default_btn.clicked.connect(self.reset_profile_to_default)
+        btn_layout.addWidget(self.save_profile_btn)
+        btn_layout.addWidget(self.reset_profile_btn)
+        btn_layout.addWidget(self.import_profile_btn)
+        btn_layout.addWidget(self.export_profile_btn)
+        btn_layout.addWidget(self.reset_default_btn)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+
+        layout.addStretch()
+        self.active_profile = None
+
+        # --- Start shortcut listener thread only once ---
+        if not hasattr(self, 'shortcut_thread_started'):
+            self.profile_shortcut_signal.connect(self.load_profile_by_name)
+            self.profile_shortcut_map = {}
+            self.shortcut_listener_active = True
+            self.shortcut_thread = threading.Thread(target=self.profile_shortcut_listener, daemon=True)
+            self.shortcut_thread.start()
+            self.shortcut_thread_started = True
+
+        # --- Validation Error Label ---
+        self.profile_validation_label = QtWidgets.QLabel("")
+        self.profile_validation_label.setStyleSheet("color: #FF3333; font-weight: bold;")
+        self.profile_validation_label.setWordWrap(True)
+        layout.addWidget(self.profile_validation_label)
+
+    def build_profile_editor_controls_grid(self):
+        for i in reversed(range(self.profile_editor_layout.count())):
+            widget = self.profile_editor_layout.itemAt(i).widget()
+            if widget:
+                widget.setParent(None)
+        self.profile_editor_controls.clear()
+        config = getattr(self, 'config', {})
+        row = 0
+        col = 0
+        # --- Section: TriggerBot ---
+        group1 = QtWidgets.QLabel("<b>TriggerBot Settings</b>")
+        group1.setToolTip("Settings for the TriggerBot feature.")
+        self.profile_editor_layout.addWidget(group1, row, 0, 1, 2)
+        row += 1
+        # --- Shortcut Key ---
+        shortcut_combo = QtWidgets.QComboBox()
+        shortcut_keys = ["None", "F6", "F7", "F8", "F9", "F10", "F11", "F12", "Ctrl+1", "Ctrl+2", "Ctrl+3", "Ctrl+4", "Ctrl+5"]
+        shortcut_combo.addItems(shortcut_keys)
+        shortcut_val = config.get("shortcut_key", "None")
+        if shortcut_val in shortcut_keys:
+            shortcut_combo.setCurrentText(shortcut_val)
+        else:
+            shortcut_combo.setCurrentText("None")
+        shortcut_combo.setToolTip("Assign a keyboard shortcut to instantly load this profile.")
+        self.profile_editor_layout.addWidget(QtWidgets.QLabel("Shortcut Key:"), row, 0)
+        self.profile_editor_layout.addWidget(shortcut_combo, row, 1)
+        self.profile_editor_controls['shortcut_key'] = shortcut_combo
+        row += 1
+        fov_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        fov_slider.setRange(1, 50)
+        fov_slider.setValue(int(config.get("fov", 5.0)))
+        fov_slider.setToolTip("Field of View: Controls the detection area size.")
+        self.profile_editor_layout.addWidget(QtWidgets.QLabel("Detection FOV:"), row, 0)
+        self.profile_editor_layout.addWidget(fov_slider, row, 1)
+        self.profile_editor_controls['fov'] = fov_slider
+        row += 1
+        key_combo = QtWidgets.QComboBox()
+        key_combo.addItems(list(self.key_map.keys()))
+        inv_key_map = {v: k for k, v in self.key_map.items()}
+        key = inv_key_map.get(config.get("keybind", 164), "Alt")
+        key_combo.setCurrentText(key)
+        key_combo.setToolTip("Key to activate TriggerBot.")
+        self.profile_editor_layout.addWidget(QtWidgets.QLabel("Activation Key:"), row, 0)
+        self.profile_editor_layout.addWidget(key_combo, row, 1)
+        self.profile_editor_controls['keybind'] = key_combo
+        row += 1
+        mode_combo = QtWidgets.QComboBox()
+        mode_combo.addItems(["hold", "toggle"])
+        mode_combo.setCurrentText(config.get("trigger_mode", "hold"))
+        mode_combo.setToolTip("TriggerBot activation mode.")
+        self.profile_editor_layout.addWidget(QtWidgets.QLabel("Trigger Mode:"), row, 0)
+        self.profile_editor_layout.addWidget(mode_combo, row, 1)
+        self.profile_editor_controls['trigger_mode'] = mode_combo
+        row += 1
+        min_delay = QtWidgets.QDoubleSpinBox()
+        min_delay.setRange(10.0, 500.0)
+        min_delay.setValue(config.get("min_shooting_delay_ms", 50.0))
+        min_delay.setSingleStep(5.0)
+        min_delay.setDecimals(0)
+        min_delay.setToolTip("Minimum shooting delay in ms.")
+        max_delay = QtWidgets.QDoubleSpinBox()
+        max_delay.setRange(10.0, 500.0)
+        max_delay.setValue(config.get("max_shooting_delay_ms", 80.0))
+        max_delay.setSingleStep(5.0)
+        max_delay.setDecimals(0)
+        max_delay.setToolTip("Maximum shooting delay in ms.")
+        delay_widget = QtWidgets.QWidget()
+        delay_layout = QtWidgets.QHBoxLayout(delay_widget)
+        delay_layout.setContentsMargins(0, 0, 0, 0)
+        delay_layout.addWidget(QtWidgets.QLabel("Min:"))
+        delay_layout.addWidget(min_delay)
+        delay_layout.addWidget(QtWidgets.QLabel("Max:"))
+        delay_layout.addWidget(max_delay)
+        self.profile_editor_layout.addWidget(QtWidgets.QLabel("Shooting Delay (ms):"), row, 0)
+        self.profile_editor_layout.addWidget(delay_widget, row, 1)
+        self.profile_editor_controls['min_shooting_delay_ms'] = min_delay
+        self.profile_editor_controls['max_shooting_delay_ms'] = max_delay
+        row += 1
+        fps_spin = QtWidgets.QDoubleSpinBox()
+        fps_spin.setRange(30.0, 1000.0)
+        fps_spin.setValue(config.get("fps", 200.0))
+        fps_spin.setSingleStep(10.0)
+        fps_spin.setDecimals(0)
+        fps_spin.setToolTip("Target FPS for scanning.")
+        self.profile_editor_layout.addWidget(QtWidgets.QLabel("Target FPS:"), row, 0)
+        self.profile_editor_layout.addWidget(fps_spin, row, 1)
+        self.profile_editor_controls['fps'] = fps_spin
+        row += 1
+        press_duration_toggle = QtWidgets.QCheckBox("Enable Random Press Duration")
+        press_duration_toggle.setChecked(config.get("enable_random_press_duration", True))
+        press_duration_toggle.setToolTip("Enable randomization of press duration for each shot.")
+        self.profile_editor_layout.addWidget(press_duration_toggle, row, 0, 1, 2)
+        self.profile_editor_controls['enable_random_press_duration'] = press_duration_toggle
+        row += 1
+        press_min = QtWidgets.QDoubleSpinBox()
+        press_min.setRange(0.01, 1.00)
+        press_min.setValue(config.get("press_duration_min_s", 0.01))
+        press_min.setSingleStep(0.01)
+        press_min.setDecimals(2)
+        press_min.setToolTip("Minimum press duration in seconds.")
+        press_max = QtWidgets.QDoubleSpinBox()
+        press_max.setRange(0.01, 1.00)
+        press_max.setValue(config.get("press_duration_max_s", 0.05))
+        press_max.setSingleStep(0.01)
+        press_max.setDecimals(2)
+        press_max.setToolTip("Maximum press duration in seconds.")
+        press_widget = QtWidgets.QWidget()
+        press_layout = QtWidgets.QHBoxLayout(press_widget)
+        press_layout.setContentsMargins(0, 0, 0, 0)
+        press_layout.addWidget(QtWidgets.QLabel("Min Duration (s):"))
+        press_layout.addWidget(press_min)
+        press_layout.addWidget(QtWidgets.QLabel("Max Duration (s):"))
+        press_layout.addWidget(press_max)
+        self.profile_editor_layout.addWidget(press_widget, row, 0, 1, 2)
+        self.profile_editor_controls['press_duration_min_s'] = press_min
+        self.profile_editor_controls['press_duration_max_s'] = press_max
+        row += 1
+        block_movements = QtWidgets.QCheckBox("Block Movement Keys While Shooting")
+        block_movements.setChecked(config.get("block_movements", False))
+        block_movements.setToolTip("Temporarily release W/A/S/D while shooting.")
+        self.profile_editor_layout.addWidget(block_movements, row, 0, 1, 2)
+        self.profile_editor_controls['block_movements'] = block_movements
+        row += 1
+        use_gpu = QtWidgets.QCheckBox("Use GPU Acceleration")
+        use_gpu.setChecked(config.get("use_gpu", False))
+        use_gpu.setToolTip("Enable GPU acceleration if available.")
+        self.profile_editor_layout.addWidget(use_gpu, row, 0, 1, 2)
+        self.profile_editor_controls['use_gpu'] = use_gpu
+        row += 1
+        smart_accel = QtWidgets.QCheckBox("Smart Acceleration")
+        smart_accel.setChecked(config.get("smart_acceleration", True))
+        smart_accel.setToolTip("Automatically select best acceleration method.")
+        self.profile_editor_layout.addWidget(smart_accel, row, 0, 1, 2)
+        self.profile_editor_controls['smart_acceleration'] = smart_accel
+        row += 1
+        test_mode = QtWidgets.QCheckBox("Test Mode")
+        test_mode.setChecked(config.get("test_mode", False))
+        test_mode.setToolTip("Enable test mode for performance comparison.")
+        self.profile_editor_layout.addWidget(test_mode, row, 0, 1, 2)
+        self.profile_editor_controls['test_mode'] = test_mode
+        row += 1
+        theme_combo = QtWidgets.QComboBox()
+        theme_combo.addItems(["dark", "light", "custom"])
+        theme_combo.setCurrentText(config.get("theme", "custom"))
+        theme_combo.setToolTip("UI theme for the app.")
+        self.profile_editor_layout.addWidget(QtWidgets.QLabel("Theme:"), row, 0)
+        self.profile_editor_layout.addWidget(theme_combo, row, 1)
+        self.profile_editor_controls['theme'] = theme_combo
+        row += 1
+        # --- Divider between TriggerBot and Aim Lock ---
+        divider = QtWidgets.QFrame()
+        divider.setFrameShape(QtWidgets.QFrame.HLine)
+        divider.setFrameShadow(QtWidgets.QFrame.Sunken)
+        self.profile_editor_layout.addWidget(divider, row, 0, 1, 2)
+        row += 1
+        # --- Section: Aim Lock ---
+        group2 = QtWidgets.QLabel("<b>Aim Lock Settings</b>")
+        group2.setToolTip("Settings for the Aim Lock feature.")
+        self.profile_editor_layout.addWidget(group2, row, 0, 1, 2)
+        row += 1
+        aim_lock_enabled = QtWidgets.QCheckBox("Enable Aim Lock")
+        aim_lock_enabled.setChecked(config.get("aim_lock_enabled", False))
+        aim_lock_enabled.setToolTip("Enable or disable Aim Lock.")
+        self.profile_editor_layout.addWidget(aim_lock_enabled, row, 0, 1, 2)
+        self.profile_editor_controls['aim_lock_enabled'] = aim_lock_enabled
+        row += 1
+        aim_lock_mode_combo = QtWidgets.QComboBox()
+        aim_lock_mode_combo.addItems(["hold", "toggle"])
+        aim_lock_mode_combo.setCurrentText(config.get("aim_lock_mode", "hold"))
+        self.profile_editor_layout.addWidget(QtWidgets.QLabel("Aim Lock Mode:"), row, 0)
+        self.profile_editor_layout.addWidget(aim_lock_mode_combo, row, 1)
+        self.profile_editor_controls['aim_lock_mode'] = aim_lock_mode_combo
+        row += 1
+        aim_lock_key_combo = QtWidgets.QComboBox()
+        aim_lock_key_combo.addItems(list(self.key_map.keys()))
+        key = inv_key_map.get(config.get("aim_lock_keybind", 164), "Alt")
+        aim_lock_key_combo.setCurrentText(key)
+        self.profile_editor_layout.addWidget(QtWidgets.QLabel("Aim Lock Key:"), row, 0)
+        self.profile_editor_layout.addWidget(aim_lock_key_combo, row, 1)
+        self.profile_editor_controls['aim_lock_keybind'] = aim_lock_key_combo
+        row += 1
+        aim_lock_strength = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        aim_lock_strength.setRange(1, 500)
+        aim_lock_strength.setValue(config.get("aim_lock_strength", 68))
+        self.profile_editor_layout.addWidget(QtWidgets.QLabel("Aim Lock Strength:"), row, 0)
+        self.profile_editor_layout.addWidget(aim_lock_strength, row, 1)
+        self.profile_editor_controls['aim_lock_strength'] = aim_lock_strength
+        row += 1
+        aim_lock_scan_x = QtWidgets.QSpinBox()
+        aim_lock_scan_x.setRange(1, 100)
+        aim_lock_scan_x.setValue(config.get("aim_lock_scan_area_x", 16))
+        self.profile_editor_layout.addWidget(QtWidgets.QLabel("Aim Lock Scan Area X:"), row, 0)
+        self.profile_editor_layout.addWidget(aim_lock_scan_x, row, 1)
+        self.profile_editor_controls['aim_lock_scan_area_x'] = aim_lock_scan_x
+        row += 1
+        aim_lock_scan_y = QtWidgets.QSpinBox()
+        aim_lock_scan_y.setRange(1, 100)
+        aim_lock_scan_y.setValue(config.get("aim_lock_scan_area_y", 10))
+        self.profile_editor_layout.addWidget(QtWidgets.QLabel("Aim Lock Scan Area Y:"), row, 0)
+        self.profile_editor_layout.addWidget(aim_lock_scan_y, row, 1)
+        self.profile_editor_controls['aim_lock_scan_area_y'] = aim_lock_scan_y
+        row += 1
+        aim_lock_debug = QtWidgets.QCheckBox("Aim Lock Debug Mode")
+        aim_lock_debug.setChecked(config.get("aim_lock_debug_mode", False))
+        self.profile_editor_layout.addWidget(aim_lock_debug, row, 0, 1, 2)
+        self.profile_editor_controls['aim_lock_debug_mode'] = aim_lock_debug
+        row += 1
+        aim_lock_adaptive = QtWidgets.QCheckBox("Aim Lock Adaptive Scan")
+        aim_lock_adaptive.setChecked(config.get("aim_lock_adaptive_scan", True))
+        self.profile_editor_layout.addWidget(aim_lock_adaptive, row, 0, 1, 2)
+        self.profile_editor_controls['aim_lock_adaptive_scan'] = aim_lock_adaptive
+        row += 1
+        aim_lock_pattern_combo = QtWidgets.QComboBox()
+        aim_lock_pattern_combo.addItems(["spiral", "grid"])
+        aim_lock_pattern_combo.setCurrentText(config.get("aim_lock_scan_pattern", "spiral"))
+        self.profile_editor_layout.addWidget(QtWidgets.QLabel("Aim Lock Scan Pattern:"), row, 0)
+        self.profile_editor_layout.addWidget(aim_lock_pattern_combo, row, 1)
+        self.profile_editor_controls['aim_lock_scan_pattern'] = aim_lock_pattern_combo
+        row += 1
+        aim_lock_tolerance = QtWidgets.QSpinBox()
+        aim_lock_tolerance.setRange(1, 100)
+        aim_lock_tolerance.setValue(config.get("aim_lock_tolerance", 45))
+        self.profile_editor_layout.addWidget(QtWidgets.QLabel("Aim Lock Tolerance:"), row, 0)
+        self.profile_editor_layout.addWidget(aim_lock_tolerance, row, 1)
+        self.profile_editor_controls['aim_lock_tolerance'] = aim_lock_tolerance
+        row += 1
+        aim_lock_refresh = QtWidgets.QSpinBox()
+        aim_lock_refresh.setRange(30, 1000)
+        aim_lock_refresh.setValue(config.get("aim_lock_refresh_rate", 240))
+        self.profile_editor_layout.addWidget(QtWidgets.QLabel("Aim Lock Refresh Rate:"), row, 0)
+        self.profile_editor_layout.addWidget(aim_lock_refresh, row, 1)
+        self.profile_editor_controls['aim_lock_refresh_rate'] = aim_lock_refresh
+        # HSV range and aim_lock_target_color are not exposed for now (advanced)
+
+    def on_profile_selected(self, idx):
+        if idx < 0 or idx >= len(self.profile_names):
+            return
+        name = self.profile_names[idx]
+        self.load_profile_by_name(name)
+        self.build_profile_editor_controls_grid()
+        self.update_profile_editor_controls_from_config()
+
+    def load_profile_by_name(self, name):
+        # Temporarily disable shortcut listener to prevent recursion/loop
+        self.shortcut_listener_active = False
+        path = os.path.join('profiles', f'{name}.json')
+        if os.path.exists(path):
+            with open(path, 'r') as f:
+                data = f.read()
+            try:
+                profile_config = json.loads(data)
+                # Map old keys to new keys for backward compatibility
+                key_map = {
+                    "min_shooting_rate": "min_shooting_delay_ms",
+                    "max_shooting_rate": "max_shooting_delay_ms",
+                    "enable_press_duration": "enable_random_press_duration",
+                    "press_duration_min": "press_duration_min_s",
+                    "press_duration_max": "press_duration_max_s",
+                }
+                for old, new in key_map.items():
+                    if old in profile_config and new not in profile_config:
+                        profile_config[new] = profile_config[old]
+                
+                # CRITICAL FIX: Keep aim_lock_toggle_key, don't remove it
+                inv_key_map = {v: k for k, v in self.key_map.items()}
+                # Remove deprecated keys except aim_lock_toggle_key
+                for deprecated in ["shooting_rate", "auto_fallback_to_cpu"]:
+                    if deprecated in profile_config:
+                        del profile_config[deprecated]
+                
+                # Ensure both aim_lock_toggle_key and aim_lock_keybind are present and consistent
+                if 'aim_lock_keybind' in profile_config:
+                    key_code = profile_config['aim_lock_keybind']
+                    # If toggle key is missing, derive it from keybind
+                    if 'aim_lock_toggle_key' not in profile_config:
+                        key_str = inv_key_map.get(key_code, 'Alt')
+                        profile_config['aim_lock_toggle_key'] = key_str.lower()
+                    # Force lowercase for keyboard detection
+                    elif profile_config['aim_lock_toggle_key'] is not None:
+                        profile_config['aim_lock_toggle_key'] = profile_config['aim_lock_toggle_key'].lower()
+                
+                # Ensure aim_lock_target_color is always an array
+                if "aim_lock_target_color" in profile_config and not isinstance(profile_config["aim_lock_target_color"], list):
+                    profile_config["aim_lock_target_color"] = [30, 255, 255]
+                self.config = profile_config.copy()
+                self.active_profile = name
+                self.active_profile_label.setText(f"Active Profile: {name}")
+                self.apply_profile_config()
+                self.update_profile_editor_controls_from_config()
+            except Exception as e:
+                QtWidgets.QMessageBox.warning(self, "Profile Load Failed", f"Failed to load profile: {e}")
+        else:
+            self.active_profile = None
+            self.active_profile_label.setText("Active Profile: None")
+        # Re-enable shortcut listener after profile load
+        self.shortcut_listener_active = True
+
+    def update_profile_editor_controls_from_config(self):
+        config = getattr(self, 'config', {})
+        # Update all controls to match config
+        self.profile_editor_controls['fov'].setValue(int(config.get("fov", 5.0)))
+        inv_key_map = {v: k for k, v in self.key_map.items()}
+        key = inv_key_map.get(config.get("keybind", 164), "Alt")
+        self.profile_editor_controls['keybind'].setCurrentText(key)
+        self.profile_editor_controls['trigger_mode'].setCurrentText(config.get("trigger_mode", "hold"))
+        self.profile_editor_controls['min_shooting_delay_ms'].setValue(config.get("min_shooting_delay_ms", 50.0))
+        self.profile_editor_controls['max_shooting_delay_ms'].setValue(config.get("max_shooting_delay_ms", 80.0))
+        self.profile_editor_controls['fps'].setValue(config.get("fps", 200.0))
+        self.profile_editor_controls['enable_random_press_duration'].setChecked(config.get("enable_random_press_duration", True))
+        self.profile_editor_controls['press_duration_min_s'].setValue(config.get("press_duration_min_s", 0.01))
+        self.profile_editor_controls['press_duration_max_s'].setValue(config.get("press_duration_max_s", 0.05))
+        self.profile_editor_controls['block_movements'].setChecked(config.get("block_movements", False))
+        self.profile_editor_controls['use_gpu'].setChecked(config.get("use_gpu", False))
+        self.profile_editor_controls['smart_acceleration'].setChecked(config.get("smart_acceleration", True))
+        self.profile_editor_controls['test_mode'].setChecked(config.get("test_mode", False))
+        self.profile_editor_controls['theme'].setCurrentText(config.get("theme", "custom"))
+        self.profile_editor_controls['aim_lock_enabled'].setChecked(config.get("aim_lock_enabled", False))
+        self.profile_editor_controls['aim_lock_mode'].setCurrentText(config.get("aim_lock_mode", "hold"))
+        key = inv_key_map.get(config.get("aim_lock_keybind", 164), "Alt")
+        self.profile_editor_controls['aim_lock_keybind'].setCurrentText(key)
+        self.profile_editor_controls['aim_lock_strength'].setValue(config.get("aim_lock_strength", 68))
+        self.profile_editor_controls['aim_lock_scan_area_x'].setValue(config.get("aim_lock_scan_area_x", 16))
+        self.profile_editor_controls['aim_lock_scan_area_y'].setValue(config.get("aim_lock_scan_area_y", 10))
+        self.profile_editor_controls['aim_lock_debug_mode'].setChecked(config.get("aim_lock_debug_mode", False))
+        self.profile_editor_controls['aim_lock_adaptive_scan'].setChecked(config.get("aim_lock_adaptive_scan", True))
+        self.profile_editor_controls['aim_lock_scan_pattern'].setCurrentText(config.get("aim_lock_scan_pattern", "spiral"))
+        self.profile_editor_controls['aim_lock_tolerance'].setValue(config.get("aim_lock_tolerance", 45))
+        self.profile_editor_controls['aim_lock_refresh_rate'].setValue(config.get("aim_lock_refresh_rate", 240))
+        self.profile_editor_controls['shortcut_key'].setCurrentText(config.get("shortcut_key", "None"))
+
+    def save_current_profile(self):
+        name = self.profile_combo.currentText()
+        path = os.path.join('profiles', f'{name}.json')
+        # Gather values from controls (only new keys)
+        config = {}
+        config['fov'] = self.profile_editor_controls['fov'].value()
+        key = self.profile_editor_controls['keybind'].currentText()
+        config['keybind'] = self.key_map.get(key, 164)
+        config['trigger_mode'] = self.profile_editor_controls['trigger_mode'].currentText()
+        config['min_shooting_delay_ms'] = self.profile_editor_controls['min_shooting_delay_ms'].value()
+        config['max_shooting_delay_ms'] = self.profile_editor_controls['max_shooting_delay_ms'].value()
+        config['fps'] = self.profile_editor_controls['fps'].value()
+        config['enable_random_press_duration'] = self.profile_editor_controls['enable_random_press_duration'].isChecked()
+        config['press_duration_min_s'] = self.profile_editor_controls['press_duration_min_s'].value()
+        config['press_duration_max_s'] = self.profile_editor_controls['press_duration_max_s'].value()
+        config['block_movements'] = self.profile_editor_controls['block_movements'].isChecked()
+        config['use_gpu'] = self.profile_editor_controls['use_gpu'].isChecked()
+        config['smart_acceleration'] = self.profile_editor_controls['smart_acceleration'].isChecked()
+        config['test_mode'] = self.profile_editor_controls['test_mode'].isChecked()
+        config['theme'] = self.profile_editor_controls['theme'].currentText()
+        config['aim_lock_enabled'] = self.profile_editor_controls['aim_lock_enabled'].isChecked()
+        config['aim_lock_mode'] = self.profile_editor_controls['aim_lock_mode'].currentText()
+        aim_lock_key = self.profile_editor_controls['aim_lock_keybind'].currentText()
+        config['aim_lock_keybind'] = self.key_map.get(aim_lock_key, 164)
+        config['aim_lock_toggle_key'] = aim_lock_key  # Ensure this is saved for persistence
+        config['aim_lock_strength'] = self.profile_editor_controls['aim_lock_strength'].value()
+        config['aim_lock_scan_area_x'] = self.profile_editor_controls['aim_lock_scan_area_x'].value()
+        config['aim_lock_scan_area_y'] = self.profile_editor_controls['aim_lock_scan_area_y'].value()
+        config['aim_lock_debug_mode'] = self.profile_editor_controls['aim_lock_debug_mode'].isChecked()
+        config['aim_lock_adaptive_scan'] = self.profile_editor_controls['aim_lock_adaptive_scan'].isChecked()
+        config['aim_lock_scan_pattern'] = self.profile_editor_controls['aim_lock_scan_pattern'].currentText()
+        config['aim_lock_tolerance'] = self.profile_editor_controls['aim_lock_tolerance'].value()
+        config['aim_lock_refresh_rate'] = self.profile_editor_controls['aim_lock_refresh_rate'].value()
+        config['shortcut_key'] = self.profile_editor_controls['shortcut_key'].currentText()
+        # Validate before saving
+        all_profiles = {}
+        for fname in os.listdir('profiles'):
+            if fname.endswith('.json'):
+                n = os.path.splitext(fname)[0]
+                with open(os.path.join('profiles', fname), 'r') as pf:
+                    try:
+                        all_profiles[n] = json.load(pf)
+                    except Exception:
+                        pass
+        is_valid, err = validate_profile(config, all_profiles, name)
+        if not is_valid:
+            self.profile_validation_label.setText(f"Validation Error: {err}")
+            QtWidgets.QMessageBox.warning(self, "Save Failed", f"Profile validation failed: {err}")
+            return
+        else:
+            self.profile_validation_label.setText("")
+        try:
+            with open(path, 'w') as f:
+                json.dump(config, f, indent=4)
+            QtWidgets.QMessageBox.information(self, "Profile Saved", f"Profile '{name}' saved successfully.")
+            self.config = config.copy()
+            self.apply_profile_config()
+            current_profile = name
+            self.refresh_profiles()
+            index = self.profile_combo.findText(current_profile)
+            if index >= 0:
+                self.profile_combo.setCurrentIndex(index)
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Save Failed", f"Failed to save profile: {e}")
+
+    def reset_profile_editor(self):
+        self.load_profile_by_name(self.profile_combo.currentText())
+        self.update_profile_editor_controls_from_config()
+
+    def on_auto_mode_toggled(self, state):
+        if state == QtCore.Qt.Checked:
+            self.start_auto_profile_detection()
+        else:
+            self.stop_auto_profile_detection()
+
+    def start_auto_profile_detection(self):
+        if hasattr(self, 'auto_mode_active') and self.auto_mode_active:
+            # Already running
+            return
             
-        frame_copy = frame.copy()
+        self.auto_status_label.setText("Auto mode enabled. Waiting for '1' or '2' key press...")
+        self.auto_status_label.setStyleSheet("color: #00FF00; font-weight: bold;")
+        self.log("Auto profile detection mode enabled")
+        self.auto_mode_active = True
+        self.auto_thread = threading.Thread(target=self.auto_profile_detection_loop, daemon=True)
+        self.auto_thread.start()
+        debug_log("Auto profile detection thread started")
+
+    def stop_auto_profile_detection(self):
+        if hasattr(self, 'auto_mode_active'):
+            self.auto_mode_active = False
+            
+        self.auto_status_label.setText("Auto mode disabled")
+        self.auto_status_label.setStyleSheet("color: #FFA500;")
+        self.log("Auto profile detection mode disabled")
         
-        # Dictionary to store results
-        results = {
-            "cpu_time": 0.0001,  # Small epsilon to prevent division by zero
-            "gpu_time": float('inf'),
-            "ratio": 0,
-            "best_method": "CPU"
+        # Give thread time to exit
+        if hasattr(self, 'auto_thread') and self.auto_thread and self.auto_thread.is_alive():
+            debug_log("Waiting for auto profile detection thread to exit")
+            time.sleep(0.5)  # Give thread time to exit gracefully
+
+    def auto_profile_detection_loop(self):
+        import win32api, win32con
+        import time
+        
+        # Load gun names
+        with open('all_guns.json', 'r') as f:
+            guns = json.load(f)
+        all_guns = [g.lower() for cat in guns.values() for g in cat]
+        
+        # Load OCR model once
+        try:
+            reader = easyocr.Reader(['en'], gpu=True, verbose=False)
+        except Exception:
+            reader = easyocr.Reader(['en'], gpu=False, verbose=False)
+        
+        # Key codes for number keys 1 and 2
+        KEY_1 = 0x31  # Virtual key code for '1'
+        KEY_2 = 0x32  # Virtual key code for '2'
+        
+        # Track previous key states to detect key presses
+        last_key_states = {
+            KEY_1: False,
+            KEY_2: False
         }
+        last_press = 0
         
-        # PyTorch GPU test (faster implementation for runtime)
-        if TORCH_AVAILABLE and torch.cuda.is_available():
-            # Force clean CUDA memory
-            torch.cuda.empty_cache()
-            
-            # Quick warmup
-            test_frame = torch.from_numpy(frame_copy).cuda(non_blocking=True).float() / 255.0
-            torch.cuda.synchronize()
-            del test_frame
-            
-            # GPU benchmark
-            gpu_start = time.time()
-            
-            for _ in range(iterations):
-                # Simplified conversion to HSV and color detection
-                frame_tensor = torch.from_numpy(frame_copy).cuda(non_blocking=True).float() / 255.0
-                if len(frame_tensor.shape) == 3:
-                    frame_tensor = frame_tensor.permute(2, 0, 1)
-                
-                # Basic HSV conversion (simplified)
-                max_val, _ = torch.max(frame_tensor, dim=0)
-                min_val, _ = torch.min(frame_tensor, dim=0)
-                
-                # Just test with a simple operation to benchmark GPU transfer and basic compute
-                diff = max_val - min_val
-                result = torch.any(diff > 0.5).item()
-                
-                torch.cuda.synchronize()
-            
-            gpu_time = (time.time() - gpu_start) * 1000 / iterations
-            results["gpu_time"] = max(gpu_time, 0.0001)  # Prevent zero
-            
-            # CPU test
-            cpu_start = time.time()
-            
-            for _ in range(iterations):
-                hsv = cv2.cvtColor(frame_copy, cv2.COLOR_RGB2HSV)
-                min_hsv = np.array([30, 125, 150], dtype=np.uint8)
-                max_hsv = np.array([30, 255, 255], dtype=np.uint8)
-                mask = cv2.inRange(hsv, min_hsv, max_hsv)
-                has_color = np.any(mask)
-            
-            cpu_time = (time.time() - cpu_start) * 1000 / iterations
-            results["cpu_time"] = max(cpu_time, 0.0001)  # Prevent zero
-            
-            # Calculate results
-            if gpu_time < float('inf'):
-                if gpu_time > 0:
-                    results["ratio"] = results["cpu_time"] / gpu_time
-                    
-                if results["ratio"] > 1:
-                    results["best_method"] = "GPU"
-                    debug_log(f"Quick benchmark: GPU is {results['ratio']:.2f}x faster ({gpu_time:.2f}ms vs {cpu_time:.2f}ms)")
-                else:
-                    results["best_method"] = "CPU"
-                    slowdown = 1.0 / max(results["ratio"], 0.0001)
-                    debug_log(f"Quick benchmark: GPU is {slowdown:.2f}x SLOWER ({gpu_time:.2f}ms vs {cpu_time:.2f}ms)")
-            else:
-                results["best_method"] = "CPU"
-                debug_log("Quick benchmark: GPU not available")
+        debug_log("Auto profile detection thread started")
+        self.log("Auto profile detection enabled - waiting for '1' or '2' key press")
         
-        return results
-    
-    except Exception as e:
-        debug_log(f"Error during quick benchmark: {str(e)}")
-        return {"best_method": "CPU", "ratio": 0}
+        while self.auto_mode_active:
+            current_time = time.time()
+            
+            # Get current key states
+            key1_state = win32api.GetAsyncKeyState(KEY_1) < 0
+            key2_state = win32api.GetAsyncKeyState(KEY_2) < 0
+            
+            # Check if key 1 was pressed (transition from not pressed to pressed)
+            if key1_state and not last_key_states[KEY_1]:
+                debug_log("Detected key '1' press")
+                if current_time - last_press > 1.0:
+                    last_press = current_time
+                    self.auto_status_label.setText("Key '1' pressed - Scanning for weapon name...")
+                    self.log("Key '1' pressed - starting weapon scan")
+                    QtCore.QMetaObject.invokeMethod(self, "scan_and_load_profile", QtCore.Qt.QueuedConnection)
+                    time.sleep(0.3)  # Prevent multiple rapid scans
+            
+            # Check if key 2 was pressed (transition from not pressed to pressed)
+            if key2_state and not last_key_states[KEY_2]:
+                debug_log("Detected key '2' press")
+                if current_time - last_press > 1.0:
+                    last_press = current_time
+                    self.auto_status_label.setText("Key '2' pressed - Scanning for weapon name...")
+                    self.log("Key '2' pressed - starting weapon scan")
+                    QtCore.QMetaObject.invokeMethod(self, "scan_and_load_profile", QtCore.Qt.QueuedConnection)
+                    time.sleep(0.3)  # Prevent multiple rapid scans
+            
+            # Update last key states
+            last_key_states[KEY_1] = key1_state
+            last_key_states[KEY_2] = key2_state
+            
+            # Add a small sleep to avoid high CPU usage
+            time.sleep(0.05)
+
+    @QtCore.pyqtSlot()
+    def scan_and_load_profile(self):
+        # Capture region and run OCR
+        debug_log("Starting scan_and_load_profile")
+        self.auto_status_label.setText("Capturing screen region...")
+        
+        try:
+            img = self.capture_bottom_right_ocr_region()
+            if img is None or img.size == 0:
+                self.auto_status_label.setText("Error: Failed to capture screen region")
+                self.log("Auto Mode Error: Failed to capture screen region")
+                debug_log("Failed to capture screen region - image is empty")
+                return
+                
+            debug_log(f"Captured image with shape: {img.shape}")
+            self.auto_status_label.setText("Processing image...")
+            gray = self.preprocess_ocr_img(img)
+            
+            # Get or create OCR reader
+            reader = getattr(self, '_easyocr_reader', None)
+            if reader is None:
+                self.auto_status_label.setText("Initializing OCR engine...")
+                try:
+                    debug_log("Initializing EasyOCR with GPU")
+                    reader = easyocr.Reader(['en'], gpu=True, verbose=False)
+                except Exception as e:
+                    debug_log(f"Failed to initialize GPU OCR: {e}, falling back to CPU")
+                    reader = easyocr.Reader(['en'], gpu=False, verbose=False)
+                self._easyocr_reader = reader
+            
+            # Perform OCR
+            self.auto_status_label.setText("Running OCR on captured region...")
+            debug_log("Starting OCR text detection")
+            results = reader.readtext(gray)
+            debug_log(f"OCR results: {results}")
+            
+            detected_texts = [text.lower() for (_, text, conf) in results]
+            debug_log(f"Detected texts: {detected_texts}")
+            
+            # Load gun names
+            with open('all_guns.json', 'r') as f:
+                guns = json.load(f)
+            all_guns = [g.lower() for cat in guns.values() for g in cat]
+            
+            # Check for matches
+            for text in detected_texts:
+                for gun in all_guns:
+                    if gun in text:
+                        self.auto_status_label.setText(f"Detected: {gun.title()} (auto-loading profile)")
+                        self.log(f"[Auto Mode] Detected and loaded profile: {gun.title()}")
+                        debug_log(f"Found matching gun: {gun} in text: {text}")
+                        
+                        # Visually highlight the loaded profile in the dropdown
+                        idx = self.profile_combo.findText(gun.title())
+                        if idx >= 0:
+                            self.profile_combo.setCurrentIndex(idx)
+                            self.profile_combo.setStyleSheet("QComboBox { background-color: #FFF176; font-weight: bold; }")
+                            QtCore.QTimer.singleShot(1500, lambda: self.profile_combo.setStyleSheet(""))
+                        else:
+                            debug_log(f"Profile not found in combo box: {gun.title()}")
+                        
+                        self.load_profile_by_name(gun.title())
+                        return
+            
+            # No match found
+            debug_log("No matching weapon detected in OCR results")
+            self.auto_status_label.setText("No matching weapon detected. Ready for next key press.")
+            self.log("[Auto Mode] No matching weapon detected.")
+            
+        except Exception as e:
+            debug_log(f"Error in scan_and_load_profile: {e}")
+            traceback.print_exc()
+            self.auto_status_label.setText(f"OCR error: {str(e)[:50]}...")
+            self.log(f"[Auto Mode] OCR error: {e}")
+
+    def capture_bottom_right_ocr_region(self):
+        # Mimic weapon_detections.py logic
+        with mss.mss() as sct:
+            monitor = sct.monitors[1]
+            width, height = monitor['width'], monitor['height']
+            region = {
+                'left': int(width * 0.9),
+                'top': int(height * 0.7),
+                'width': int(width * 0.1),
+                'height': int(height * 0.3)
+            }
+            img = np.asarray(sct.grab(region))[..., :3]
+            h, w = img.shape[:2]
+            crop_left = min(20, w-1)
+            crop_right = max(w - 89, crop_left+1)
+            crop_bottom = max(h - 185, 1)
+            cropped = img[0:crop_bottom, crop_left:crop_right]
+            return cropped
+
+    def preprocess_ocr_img(self, img):
+        import cv2
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        return gray
+
+    def refresh_profiles(self):
+        self.profile_names = []
+        if not os.path.exists('profiles'):
+            os.makedirs('profiles')
+        for fname in sorted(os.listdir('profiles')):
+            if fname.endswith('.json'):
+                profile_name = os.path.splitext(fname)[0]
+                self.profile_names.append(profile_name)
+        if hasattr(self, 'profile_combo'):
+            self.profile_combo.clear()
+            self.profile_combo.addItems(self.profile_names)
+
+    def get_current_shortcut_map(self):
+        shortcut_map = {}
+        if not os.path.exists('profiles'):
+            return shortcut_map
+        for fname in sorted(os.listdir('profiles')):
+            if fname.endswith('.json'):
+                profile_name = os.path.splitext(fname)[0]
+                try:
+                    with open(os.path.join('profiles', fname), 'r') as f:
+                        data = json.load(f)
+                        shortcut = data.get('shortcut_key', None)
+                        if shortcut and shortcut != "None":
+                            shortcut_map[shortcut] = profile_name
+                except Exception:
+                    pass
+        return shortcut_map
+
+    def profile_shortcut_listener(self):
+        import win32api
+        import win32con
+        import time
+        print('[DEBUG] Shortcut listener thread started')
+        key_map = {
+            "F6": win32con.VK_F6,
+            "F7": win32con.VK_F7,
+            "F8": win32con.VK_F8,
+            "F9": win32con.VK_F9,
+            "F10": win32con.VK_F10,
+            "F11": win32con.VK_F11,
+            "F12": win32con.VK_F12,
+        }
+        ctrl_map = {
+            "Ctrl+1": 0x31,  # 1
+            "Ctrl+2": 0x32,
+            "Ctrl+3": 0x33,
+            "Ctrl+4": 0x34,
+            "Ctrl+5": 0x35,
+        }
+        last_key_state = {}
+        last_map_print = 0
+        last_shortcut_map = None
+        while True:
+            now = time.time()
+            shortcut_map = self.get_current_shortcut_map()
+            # Only print if changed or every 10 seconds
+            if shortcut_map != last_shortcut_map or now - last_map_print > 10:
+                print(f'[DEBUG] Current shortcut map: {shortcut_map}')
+                last_map_print = now
+                last_shortcut_map = shortcut_map.copy()
+            for shortcut, profile in shortcut_map.items():
+                if shortcut in key_map:
+                    vk = key_map[shortcut]
+                    pressed = win32api.GetAsyncKeyState(vk) < 0
+                    prev = last_key_state.get(shortcut, False)
+                    if pressed and not prev:
+                        print(f"[DEBUG] Shortcut pressed: {shortcut} -> {profile}")
+                        self.profile_shortcut_signal.emit(profile)
+                        self.shortcut_status_label.setText(f"Shortcut: Loaded {profile}")
+                    last_key_state[shortcut] = pressed
+                elif shortcut in ctrl_map:
+                    vk = ctrl_map[shortcut]
+                    ctrl_pressed = win32api.GetAsyncKeyState(win32con.VK_CONTROL) < 0
+                    key_pressed = win32api.GetAsyncKeyState(vk) < 0
+                    pressed = ctrl_pressed and key_pressed
+                    prev = last_key_state.get(shortcut, False)
+                    if pressed and not prev:
+                        print(f"[DEBUG] Shortcut pressed: {shortcut} -> {profile}")
+                        self.profile_shortcut_signal.emit(profile)
+                        self.shortcut_status_label.setText(f"Shortcut: Loaded {profile}")
+                    last_key_state[shortcut] = pressed
+            time.sleep(0.05)
+
+    def apply_profile_config(self):
+        # Apply config to running modules (TriggerBot, AimLock, etc.)
+        if hasattr(self, 'trigger_bot_thread') and self.trigger_bot_thread and hasattr(self.trigger_bot_thread, 'update_config') and self.trigger_bot_thread.isRunning():
+            self.trigger_bot_thread.update_config(self.config)
+        
+        # CRITICAL FIX: Force aimlock controller reinitialization for key persistence
+        print('[DEBUG] Applying profile: aim_lock_toggle_key =', self.config.get('aim_lock_toggle_key'), 'aim_lock_keybind =', self.config.get('aim_lock_keybind'))
+        if hasattr(self, 'aim_lock_controller') and self.aim_lock_controller:
+            # Fully reinitialize controller to ensure it picks up the new key
+            self.aim_lock_controller.stop()
+            del self.aim_lock_controller
+            self.aim_lock_controller = AimLockController(self.config)
+            if self.config.get('aim_lock_enabled', False):
+                self.aim_lock_controller.start()
+        
+        if hasattr(self, 'log'):
+            self.log(f"Profile '{self.active_profile}' loaded and applied.")
+
+    # Utility: Batch-migrate all profiles in 'profiles' directory to new schema
+    def migrate_all_profiles_to_new_schema(self):
+        profiles_dir = 'profiles'
+        key_map = {
+            "min_shooting_rate": "min_shooting_delay_ms",
+            "max_shooting_rate": "max_shooting_delay_ms",
+            "enable_press_duration": "enable_random_press_duration",
+            "press_duration_min": "press_duration_min_s",
+            "press_duration_max": "press_duration_max_s",
+        }
+        deprecated = ["shooting_rate", "auto_fallback_to_cpu", "aim_lock_toggle_key"]
+        for fname in os.listdir(profiles_dir):
+            if fname.endswith('.json'):
+                path = os.path.join(profiles_dir, fname)
+                try:
+                    with open(path, 'r') as f:
+                        data = json.load(f)
+                    # Map old keys
+                    for old, new in key_map.items():
+                        if old in data and new not in data:
+                            data[new] = data[old]
+                    # Remove deprecated
+                    for dep in deprecated:
+                        if dep in data:
+                            del data[dep]
+                    # Ensure aim_lock_target_color is always an array
+                    if "aim_lock_target_color" in data and not isinstance(data["aim_lock_target_color"], list):
+                        data["aim_lock_target_color"] = [30, 255, 255]
+                    # Only keep new keys
+                    allowed_keys = [
+                        'fov', 'keybind', 'trigger_mode', 'min_shooting_delay_ms', 'max_shooting_delay_ms', 'fps',
+                        'hsv_range', 'enable_random_press_duration', 'press_duration_min_s', 'press_duration_max_s',
+                        'block_movements', 'use_gpu', 'smart_acceleration', 'test_mode', 'theme',
+                        'aim_lock_enabled', 'aim_lock_mode', 'aim_lock_keybind', 'aim_lock_strength',
+                        'aim_lock_scan_area_x', 'aim_lock_scan_area_y', 'aim_lock_debug_mode',
+                        'aim_lock_adaptive_scan', 'aim_lock_scan_pattern', 'aim_lock_tolerance',
+                        'aim_lock_refresh_rate', 'shortcut_key', 'aim_lock_target_color'
+                    ]
+                    data = {k: v for k, v in data.items() if k in allowed_keys}
+                    with open(path, 'w') as f:
+                        json.dump(data, f, indent=4)
+                    print(f"Migrated profile: {fname}")
+                except Exception as e:
+                    print(f"Failed to migrate {fname}: {e}")
+
+    def import_profile(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Import Profile", "", "JSON Files (*.json)")
+        if not file_path:
+            return
+        try:
+            with open(file_path, 'r') as f:
+                imported = json.load(f)
+            # Validate imported profile
+            all_profiles = {}
+            for fname in os.listdir('profiles'):
+                if fname.endswith('.json'):
+                    n = os.path.splitext(fname)[0]
+                    with open(os.path.join('profiles', fname), 'r') as pf:
+                        try:
+                            all_profiles[n] = json.load(pf)
+                        except Exception:
+                            pass
+            is_valid, err = validate_profile(imported, all_profiles)
+            if not is_valid:
+                QtWidgets.QMessageBox.warning(self, "Import Failed", f"Profile validation failed: {err}")
+                return
+            # Ask for profile name
+            name, ok = QtWidgets.QInputDialog.getText(self, "Profile Name", "Enter a name for the imported profile:")
+            if not ok or not name.strip():
+                return
+            name = name.strip()
+            if name in all_profiles:
+                QtWidgets.QMessageBox.warning(self, "Import Failed", f"A profile named '{name}' already exists.")
+                return
+            # Save imported profile
+            with open(os.path.join('profiles', f'{name}.json'), 'w') as f:
+                json.dump(imported, f, indent=4)
+            QtWidgets.QMessageBox.information(self, "Import Successful", f"Profile '{name}' imported successfully.")
+            self.refresh_profiles()
+            index = self.profile_combo.findText(name)
+            if index >= 0:
+                self.profile_combo.setCurrentIndex(index)
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Import Failed", f"Failed to import profile: {e}")
+
+    def export_profile(self):
+        name = self.profile_combo.currentText()
+        if not name:
+            QtWidgets.QMessageBox.warning(self, "Export Failed", "No profile selected to export.")
+            return
+        path = os.path.join('profiles', f'{name}.json')
+        if not os.path.exists(path):
+            QtWidgets.QMessageBox.warning(self, "Export Failed", f"Profile file '{name}.json' not found.")
+            return
+        file_path, _ = QFileDialog.getSaveFileName(self, "Export Profile", f"{name}.json", "JSON Files (*.json)")
+        if not file_path:
+            return
+        try:
+            with open(path, 'r') as f:
+                data = f.read()
+            with open(file_path, 'w') as f:
+                f.write(data)
+            QtWidgets.QMessageBox.information(self, "Export Successful", f"Profile '{name}' exported successfully.")
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Export Failed", f"Failed to export profile: {e}")
+
+    def reset_profile_to_default(self):
+        name = self.profile_combo.currentText()
+        if not name:
+            QtWidgets.QMessageBox.warning(self, "Reset Failed", "No profile selected to reset.")
+            return
+        # Confirm with user
+        reply = QtWidgets.QMessageBox.question(self, "Reset to Default", f"Are you sure you want to reset profile '{name}' to default values? This cannot be undone.", QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
+        if reply != QtWidgets.QMessageBox.Yes:
+            return
+        try:
+            default_profile = load_config()  # Get default values
+            with open(os.path.join('profiles', f'{name}.json'), 'w') as f:
+                json.dump(default_profile, f, indent=4)
+            QtWidgets.QMessageBox.information(self, "Reset Successful", f"Profile '{name}' has been reset to default values.")
+            self.load_profile_by_name(name)
+            self.update_profile_editor_controls_from_config()
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Reset Failed", f"Failed to reset profile: {e}")
+
+def migrate_aimlock_key_fields():
+    # Migrate config.json
+    config_path = 'config.json'
+    key_map = {
+        "Alt": 164, "Shift": 160, "Caps Lock": 20, "Tab": 9, "X": 0x58, "C": 0x43, "Z": 0x5A, "V": 0x56,
+        "Mouse Right": 0x02, "Mouse 3": 0x04, "Mouse 4": 0x05, "Mouse 5": 0x06
+    }
+    inv_key_map = {v: k for k, v in key_map.items()}
+    if os.path.exists(config_path):
+        with open(config_path, 'r') as f:
+            data = json.load(f)
+        if 'aim_lock_keybind' in data and 'aim_lock_toggle_key' not in data:
+            key_code = data['aim_lock_keybind']
+            key_str = inv_key_map.get(key_code, 'Alt')
+            data['aim_lock_toggle_key'] = key_str
+            with open(config_path, 'w') as f:
+                json.dump(data, f, indent=4)
+    # Migrate all profiles
+    profiles_dir = 'profiles'
+    if os.path.exists(profiles_dir):
+        for fname in os.listdir(profiles_dir):
+            if fname.endswith('.json'):
+                path = os.path.join(profiles_dir, fname)
+                with open(path, 'r') as f:
+                    pdata = json.load(f)
+                if 'aim_lock_keybind' in pdata and 'aim_lock_toggle_key' not in pdata:
+                    key_code = pdata['aim_lock_keybind']
+                    key_str = inv_key_map.get(key_code, 'Alt')
+                    pdata['aim_lock_toggle_key'] = key_str
+                    with open(path, 'w') as f:
+                        json.dump(pdata, f, indent=4)
+
+# Call migration at startup
+migrate_aimlock_key_fields()
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
