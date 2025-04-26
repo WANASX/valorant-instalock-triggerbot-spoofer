@@ -226,6 +226,15 @@ class AimLockController:
         last_key_state = False
         toggled_active = False
         last_key_str = None
+        
+        # Mouse button key codes map for detection
+        mouse_buttons = {
+            "mouse right": 0x02,
+            "mouse 3": 0x04,
+            "mouse 4": 0x05,
+            "mouse 5": 0x06
+        }
+        
         while not self.should_exit:
             try:
                 # Always get the latest key from self.config
@@ -237,12 +246,22 @@ class AimLockController:
                 if key_str != last_key_str:
                     print(f"[DEBUG] AimLock activation key changed to: {key_str}")
                     last_key_str = key_str
+                
                 key_state = False
-                try:
-                    import keyboard
-                    key_state = keyboard.is_pressed(key_str)
-                except Exception as e:
-                    log_event(f"Error in key detection: {e}", "ERROR", context="AIMLOCK")
+                
+                # Check if it's a mouse button
+                if key_str in mouse_buttons:
+                    # Use win32api for mouse button detection
+                    import win32api
+                    key_state = win32api.GetAsyncKeyState(mouse_buttons[key_str]) < 0
+                else:
+                    # Use keyboard module for normal keyboard keys
+                    try:
+                        import keyboard
+                        key_state = keyboard.is_pressed(key_str)
+                    except Exception as e:
+                        log_event(f"Error in key detection: {e}", "ERROR", context="AIMLOCK")
+                
                 if mode == "hold":
                     self.is_active = key_state
                 else:  # toggle

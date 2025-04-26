@@ -1,6 +1,6 @@
 {
     "fov": 2,
-    "keybind": 164,
+    "keybind": 2,
     "fps": 200.0,
     "hsv_range": [
         [
@@ -35,12 +35,12 @@
     "aim_lock_debug_mode": false,
     "aim_lock_adaptive_scan": true,
     "aim_lock_scan_pattern": "spiral",
-    "aim_lock_keybind": 160,
+    "aim_lock_keybind": 2,
     "min_shooting_delay_ms": 30.0,
     "max_shooting_delay_ms": 40.0,
     "enable_random_press_duration": true,
     "press_duration_min_s": 0.01,
     "press_duration_max_s": 0.05,
     "shooting_rate": 35.0,
-    "aim_lock_toggle_key": "Shift"
+    "aim_lock_toggle_key": "mouse right"
 }
